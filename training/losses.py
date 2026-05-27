@@ -1,6 +1,8 @@
 # training/losses.py
 
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 import torch.nn.functional as F
 
 
@@ -562,24 +564,10 @@ def total_coarse_loss(
     """
     Coarse matching loss.
 
-    Supports two matching-loss paths:
-
-    1. Chunked path:
-        outputs contains:
-            loss_match_kl_chunked
-            loss_match_ce_chunked
-
-        This is the recommended training path.
-        It does NOT require full outputs["scores"] / outputs["candidate_coords_feat"].
-
-    2. Full-aux fallback path:
-        outputs contains:
-            scores
-            candidate_coords_feat
-            candidate_valid_mask
-            coord_scale
-
-        This is useful for debugging / inference diagnostics, but costs much more memory.
+    Stage-4 / residual-only compatible version:
+        1. match loss is computed only when enabled.
+        2. pred_mag_mean / gt_mag_mean are always defined.
+        3. loss_mode="coord" does not require outputs["scores"].
     """
     pred_disp = outputs["pred_disp"]
     pred_coords = outputs.get("pred_coords", None)
@@ -587,13 +575,44 @@ def total_coarse_loss(
     if z_init is None:
         z_init = sparse_z_idx
 
-    total = pred_disp.sum() * 0.0
+    zero = pred_disp.sum() * 0.0
+    total = zero
     loss_dict = {}
 
     # ======================================================
-    # 1. Matching loss: prefer chunked CE/KL if available
+    # 0. Always compute displacement magnitude metrics
     # ======================================================
-    if loss_mode == "match" or lambda_match > 0:
+    with torch.no_grad():
+        pred_mag_map = torch.linalg.norm(pred_disp, dim=-1)
+
+        if gt_disp is not None:
+            gt_disp_metric = gt_disp.to(
+                device=pred_disp.device,
+                dtype=pred_disp.dtype,
+            )
+            gt_mag_map = torch.linalg.norm(gt_disp_metric, dim=-1)
+
+            if valid_mask is not None:
+                valid = valid_mask.to(pred_disp.device).float()
+                denom = valid.sum().clamp_min(1.0)
+                pred_mag_mean = (pred_mag_map * valid).sum() / denom
+                gt_mag_mean = (gt_mag_map * valid).sum() / denom
+            else:
+                pred_mag_mean = pred_mag_map.mean()
+                gt_mag_mean = gt_mag_map.mean()
+
+            pred_gt_mag_ratio = pred_mag_mean / (gt_mag_mean + 1e-6)
+        else:
+            pred_mag_mean = pred_mag_map.mean()
+            gt_mag_mean = zero.detach()
+            pred_gt_mag_ratio = zero.detach()
+
+    # ======================================================
+    # 1. Matching loss
+    # ======================================================
+    use_match_loss = (lambda_match > 0) or (loss_mode == "match")
+
+    if use_match_loss:
         if gt_coords is None:
             raise ValueError("match loss requires gt_coords.")
 
@@ -603,79 +622,27 @@ def total_coarse_loss(
         )
 
         if has_chunked_match_loss:
-            # --------------------------------------------------
-            # Recommended path:
-            # CE/KL already computed inside model chunk-by-chunk.
-            # This avoids storing full scores/prob/candidates.
-            # --------------------------------------------------
             loss_match_kl = outputs["loss_match_kl_chunked"]
             loss_match_ce = outputs["loss_match_ce_chunked"]
 
-            # Use chunked metrics if model returned them.
             zero_metric = loss_match_ce.detach() * 0.0
 
             match_metrics = {
                 "loss_match_kl": loss_match_kl.detach(),
                 "loss_match_ce": loss_match_ce.detach(),
-
-                "match_top1": outputs.get(
-                    "match_top1_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "match_top5": outputs.get(
-                    "match_top5_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "match_prob_max": outputs.get(
-                    "match_prob_max_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "match_entropy": outputs.get(
-                    "match_entropy_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "match_inside_ratio": outputs.get(
-                    "match_inside_valid_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "match_inside_valid": outputs.get(
-                    "match_inside_valid_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "match_inside_all": outputs.get(
-                    "match_inside_all_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "match_valid_and_inside_all": outputs.get(
-                    "match_valid_and_inside_all_chunked",
-                    zero_metric,
-                ).detach(),
-
-                "candidate_valid_ratio": outputs.get(
-                    "candidate_valid_ratio_chunked",
-                    zero_metric,
-                ).detach(),
-
-                # This is not always computed in chunked mode.
-                "match_min_dist2": outputs.get(
-                    "match_min_dist2_chunked",
-                    zero_metric,
-                ).detach(),
+                "match_top1": outputs.get("match_top1_chunked", zero_metric).detach(),
+                "match_top5": outputs.get("match_top5_chunked", zero_metric).detach(),
+                "match_prob_max": outputs.get("match_prob_max_chunked", zero_metric).detach(),
+                "match_entropy": outputs.get("match_entropy_chunked", zero_metric).detach(),
+                "match_inside_ratio": outputs.get("match_inside_valid_chunked", zero_metric).detach(),
+                "match_inside_valid": outputs.get("match_inside_valid_chunked", zero_metric).detach(),
+                "match_inside_all": outputs.get("match_inside_all_chunked", zero_metric).detach(),
+                "match_valid_and_inside_all": outputs.get("match_valid_and_inside_all_chunked", zero_metric).detach(),
+                "candidate_valid_ratio": outputs.get("candidate_valid_ratio_chunked", zero_metric).detach(),
+                "match_min_dist2": outputs.get("match_min_dist2_chunked", zero_metric).detach(),
             }
-
         else:
-            # --------------------------------------------------
-            # Fallback path:
-            # full scores/candidates must exist.
-            # This is memory-heavy, so do NOT use it in normal training.
-            # --------------------------------------------------
+            # Full-aux fallback. Requires return_match_aux=True and is memory-heavy.
             loss_match_kl, kl_metrics = local_match_kl_loss(
                 outputs=outputs,
                 gt_coords=gt_coords,
@@ -701,28 +668,10 @@ def total_coarse_loss(
             + lambda_match_ce * loss_match_ce
         )
 
-        total = total + lambda_match * loss_match
-
-        with torch.no_grad():
-            if gt_disp is not None:
-                pred_mag_map = torch.linalg.norm(pred_disp, dim=-1)
-                gt_mag_map = torch.linalg.norm(gt_disp.to(pred_disp.device).float(), dim=-1)
-
-                if valid_mask is not None:
-                    valid = valid_mask.to(pred_disp.device).float()
-                    denom = valid.sum() + 1e-6
-                    pred_mag_mean = (pred_mag_map * valid).sum() / denom
-                    gt_mag_mean = (gt_mag_map * valid).sum() / denom
-                else:
-                    pred_mag_mean = pred_mag_map.mean()
-                    gt_mag_mean = gt_mag_map.mean()
-
-                pred_gt_mag_ratio = pred_mag_mean / (gt_mag_mean + 1e-6)
-            else:
-                pred_mag_mean = pred_disp.sum() * 0.0
-                gt_mag_mean = pred_disp.sum() * 0.0
-                pred_gt_mag_ratio = pred_disp.sum() * 0.0
-
+        if loss_mode == "match":
+            total = total + loss_match
+        else:
+            total = total + lambda_match * loss_match
 
         loss_dict.update(match_metrics)
         loss_dict["loss_match"] = loss_match.detach()
@@ -730,10 +679,28 @@ def total_coarse_loss(
         loss_dict["loss_match_ce"] = loss_match_ce.detach()
 
     else:
-        loss_match = pred_disp.sum() * 0.0
-        loss_dict["loss_match"] = loss_match.detach()
-        loss_dict["loss_match_kl"] = loss_match.detach()
-        loss_dict["loss_match_ce"] = loss_match.detach()
+        loss_match = zero
+        loss_match_kl = zero
+        loss_match_ce = zero
+
+        loss_dict["loss_match"] = zero.detach()
+        loss_dict["loss_match_kl"] = zero.detach()
+        loss_dict["loss_match_ce"] = zero.detach()
+
+        # Keep logger keys stable even when match loss is disabled.
+        for k in [
+            "match_top1",
+            "match_top5",
+            "match_prob_max",
+            "match_entropy",
+            "match_inside_ratio",
+            "match_inside_valid",
+            "match_inside_all",
+            "match_valid_and_inside_all",
+            "candidate_valid_ratio",
+            "match_min_dist2",
+        ]:
+            loss_dict[k] = zero.detach()
 
     # ======================================================
     # 2. Coordinate loss
@@ -741,7 +708,7 @@ def total_coarse_loss(
     if use_coord_loss and pred_coords is not None and gt_coords is not None:
         loss_coord = coord_l1_loss(pred_coords, gt_coords, valid_mask)
     else:
-        loss_coord = pred_disp.sum() * 0.0
+        loss_coord = zero
 
     if loss_mode == "coord":
         total = total + loss_coord
@@ -754,18 +721,15 @@ def total_coarse_loss(
     if gt_disp is not None:
         loss_disp = disp_l1_loss(pred_disp, gt_disp, valid_mask)
     else:
-        loss_disp = pred_disp.sum() * 0.0
+        loss_disp = zero
 
     if loss_mode == "disp":
         total = total + loss_disp
     else:
         total = total + lambda_disp * loss_disp
 
-
     # ======================================================
-    # 3b. Displacement magnitude losses
-    #     These terms prevent the conservative shortcut:
-    #         pred_mag << gt_mag
+    # 3b. Displacement magnitude loss
     # ======================================================
     if gt_disp is not None:
         loss_disp_mag = disp_magnitude_loss(
@@ -773,12 +737,11 @@ def total_coarse_loss(
             gt_disp=gt_disp,
             valid_mask=valid_mask,
         )
-
     else:
-        loss_disp_mag = pred_disp.sum() * 0.0
-        loss_disp_under_mag = pred_disp.sum() * 0.0
+        loss_disp_mag = zero
 
     total = total + lambda_disp_mag * loss_disp_mag
+
     # ======================================================
     # 4. Smoothness loss
     # ======================================================
@@ -789,7 +752,7 @@ def total_coarse_loss(
     # 5. Z-spacing consistency
     # ======================================================
     if spacing is None:
-        loss_z_spacing = pred_disp.sum() * 0.0
+        loss_z_spacing = zero
     else:
         if pred_coords is not None:
             loss_z_spacing = z_spacing_consistency_loss_from_coords(
@@ -824,7 +787,6 @@ def total_coarse_loss(
             "loss_coord": loss_coord.detach(),
             "loss_disp": loss_disp.detach(),
 
-            # new
             "loss_disp_mag": loss_disp_mag.detach(),
             "pred_mag_mean": pred_mag_mean.detach(),
             "gt_mag_mean": gt_mag_mean.detach(),

@@ -7,6 +7,8 @@
 
 import math
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -106,7 +108,18 @@ class WindowSelfAttention2D(nn.Module):
         Hp, Wp = x_pad.shape[-2:]
 
         # (B,C,Hp,Wp) -> (B*nW, ws*ws, C)
-        x_win = x_pad.unfold(2, ws, ws).unfold(3, ws, ws)
+        B, C, H_pad, W_pad = x_pad.shape
+        assert H_pad % ws == 0 and W_pad % ws == 0
+
+        nH = H_pad // ws
+        nW = W_pad // ws
+
+        x_win = (
+            x_pad.contiguous()
+            .view(B, C, nH, ws, nW, ws)
+            .permute(0, 1, 2, 4, 3, 5)
+            .contiguous()
+        )
         x_win = x_win.permute(0, 2, 3, 4, 5, 1).contiguous()
         x_win = x_win.view(-1, ws * ws, C)
 

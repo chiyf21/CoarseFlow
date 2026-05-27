@@ -3,19 +3,76 @@
 import os
 import time
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
-from torch.cuda.amp import autocast, GradScaler
-from CoarseFlow.models.SparseGMFlow3D import (
+try:
+    from torch_npu.npu.amp import autocast, GradScaler
+except Exception:
+    from torch.cuda.amp import autocast, GradScaler
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from models.SparseGMFlow3D import (
     CoarseMatchingNetV3,
     CoarseMatchingNetV4,
     CoarseMatchingNetV5,
 )
-from CoarseFlow.models.SparseGMFlow3D_v2 import CoarseMatchingNetV6,count_parameters_by_module,count_parameters
-from CoarseFlow.training.losses import total_coarse_loss
+from models.SparseGMFlow3D_v2 import CoarseMatchingNetV6,count_parameters_by_module,count_parameters
+from training.losses import total_coarse_loss
 import logging
 import sys
 from scipy.interpolate import RegularGridInterpolator
+
+def setup_distributed():
+    if "RANK" not in os.environ:
+        return False, 0, 1, 0
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+
+    torch.npu.set_device(local_rank)
+    dist.init_process_group(backend="hccl")
+
+    return True, rank, world_size, local_rank
+
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process(rank=0):
+    return (not is_dist_avail_and_initialized()) or rank == 0
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, DDP) else model
+
+
+def reduce_train_loss_sum(running_loss, num_steps, device):
+    """
+    Reduce local running_loss and num_steps across all ranks.
+    Return global average loss.
+    """
+    t = torch.tensor(
+        [float(running_loss), float(num_steps)],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    if is_dist_avail_and_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    return (t[0] / t[1].clamp_min(1.0)).item()
+
+
+def cleanup_distributed():
+    if is_dist_avail_and_initialized():
+        dist.destroy_process_group()
 
 def setup_logger(save_dir, filename="train.log", mode="a"):
     """
@@ -53,8 +110,8 @@ def setup_logger(save_dir, filename="train.log", mode="a"):
 
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
-
-    logger.info(f"[Logger] log file: {log_path}")
+    if logger is not None:
+        logger.info(f"[Logger] log file: {log_path}")
     return logger
 
 def move_batch_to_device(batch, device):
@@ -105,12 +162,17 @@ def train_one_epoch(
     compute_chunk_match_loss=True,
     match_sigma=(0.5, 0.75, 0.75),
     match_inside_threshold=4.0,
+    is_dist=False,
+    rank=0,
+    world_size=1,
     logger=None,
 ):
     model.train()
+    base_model = unwrap_model(model)
     if freeze_encoders:
         keep_frozen_encoders_eval(model)
     running_loss = 0.0
+    num_steps = 0
     t0 = time.time()
 
     for step, batch in enumerate(loader):
@@ -144,7 +206,7 @@ def train_one_epoch(
                 mov=mov,
                 ref=ref,
                 z_init=z_init,
-                control_stride=model.control_stride,
+                control_stride=base_model.control_stride,
                 intensity_quantile=0.40,
                 grad_quantile=0.40,
                 smooth_kernel=5,
@@ -214,9 +276,10 @@ def train_one_epoch(
 
             optimizer.step()
 
-        running_loss += loss.item()
+        running_loss += loss.detach().float().item()
+        num_steps += 1
 
-        if step % log_interval == 0:
+        if rank == 0 and step % log_interval == 0:
             valid_ratio = valid_mask.float().mean().item() if valid_mask is not None else 1.0
             msg = (
                 f"[Epoch {epoch:03d}] "
@@ -245,7 +308,7 @@ def train_one_epoch(
             else:
                 print(msg)
 
-    return running_loss / max(len(loader), 1)
+    return reduce_train_loss_sum(running_loss, num_steps, device)
 
 def build_gt_in_bounds_mask(gt_coords, ref, eps=1e-6):
     """
@@ -297,7 +360,7 @@ def validate_one_epoch(
     logger=None,
 ):
     model.eval()
-
+    base_model = unwrap_model(model)
     metric_sums = {}
     num_batches = 0
 
@@ -322,7 +385,7 @@ def validate_one_epoch(
                 mov=mov,
                 ref=ref,
                 z_init=z_init,
-                control_stride=model.control_stride,
+                control_stride=base_model.control_stride,
                 intensity_quantile=0.40,
                 grad_quantile=0.40,
                 smooth_kernel=5,
@@ -478,7 +541,7 @@ def save_checkpoint(
 
     ckpt = {
         "epoch": epoch,
-        "model": model.state_dict(),
+        "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "best_val_loss": best_val_loss,
         "model_config": model_config,
@@ -582,9 +645,29 @@ def train_coarse_matching_model(
     train_only_residual=False,
     freeze_encoder=False,
     residual_lr=None,
+
+    is_dist=False,
+    rank=0,
+    world_size=1,
+
+    ddp_find_unused_parameters=True,
 ):
+    # ----------------------------------------------------
+    # Distributed / device setup
+    # ----------------------------------------------------
+    is_dist, rank, world_size, local_rank = setup_distributed()
+    main_process = (rank == 0)
+
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            device = f"npu:{local_rank if is_dist else 0}"
+        elif torch.cuda.is_available():
+            device = f"cuda:{local_rank if is_dist else 0}"
+        else:
+            device = "cpu"
+
+    device = torch.device(device)
+    print(f"[Overfit] device = {device}")
 
     device = torch.device(device)
 
@@ -598,23 +681,41 @@ def train_coarse_matching_model(
                 "Either train_dataset or train_loader must be provided."
             )
 
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False,
+        ) if is_dist else None
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=False,
         )
 
     if val_loader is None:
         if val_dataset is not None:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False,
+            ) if is_dist else None
+
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=1,
                 shuffle=False,
+                sampler=val_sampler,
                 num_workers=num_workers,
-                pin_memory=True,
+                pin_memory=False,
                 drop_last=False,
             )
 
@@ -674,6 +775,8 @@ def train_coarse_matching_model(
         residual_use_disp=residual_use_disp,
         residual_detach_coarse=residual_detach_coarse,
         residual_detach_features=residual_detach_features,
+        
+
     )
     
     model = CoarseMatchingNetV6(**model_config).to(device)
@@ -687,9 +790,11 @@ def train_coarse_matching_model(
         save_dir=save_dir,
         filename=log_filename,
         mode=log_mode,
-    )
+    ) if main_process else None
+
     if resume_path is not None:
-        logger.info(f"[Resume] Loading checkpoint: {resume_path}")
+        if logger is not None:
+            logger.info(f"[Resume] Loading checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
 
         load_msg = model.load_state_dict(
@@ -698,7 +803,8 @@ def train_coarse_matching_model(
         )
 
         if not strict_load:
-            logger.info(msg=f"[Resume] load_state_dict message: {load_msg}")
+            if logger is not None:
+                logger.info(msg=f"[Resume] load_state_dict message: {load_msg}")
 
 
         if resume_best_val_loss and "best_val_loss" in ckpt and ckpt["best_val_loss"] is not None:
@@ -708,8 +814,8 @@ def train_coarse_matching_model(
 
         if "epoch" in ckpt:
             start_epoch = int(ckpt["epoch"]) + 1
-
-        logger.info(f"[Resume] start_epoch = {start_epoch}")
+        if logger is not None:
+            logger.info(f"[Resume] start_epoch = {start_epoch}")
     else:
         best_val_loss = float("inf")
     # ----------------------------------------------------
@@ -735,7 +841,8 @@ def train_coarse_matching_model(
             verbose=False,
         )
 
-        logger.info("[Freeze encoders] moving_encoder and reference_encoder are frozen.")
+        if logger is not None:
+            logger.info("[Freeze encoders] moving_encoder and reference_encoder are frozen.")
 
     # ----------------------------------------------------
     # Build optimizer after loading checkpoint and freezing parameters
@@ -753,8 +860,8 @@ def train_coarse_matching_model(
             lr=lr_res,
             weight_decay=weight_decay,
         )
-
-        logger.info(f"[Optimizer] residual-only optimizer, lr={lr_res}")
+        if logger is not None:
+            logger.info(f"[Optimizer] residual-only optimizer, lr={lr_res}")
 
     elif residual_lr is not None and hasattr(model, "coord_residual_refiner") and model.coord_residual_refiner is not None:
         residual_param_ids = {
@@ -795,10 +902,10 @@ def train_coarse_matching_model(
             )
 
         optimizer = torch.optim.AdamW(param_groups)
-
-        logger.info(
-            f"[Optimizer] two lr groups: base lr={lr}, residual lr={residual_lr}"
-        )
+        if logger is not None:
+            logger.info(
+                f"[Optimizer] two lr groups: base lr={lr}, residual lr={residual_lr}"
+            )
 
     else:
         optimizer = torch.optim.AdamW(
@@ -806,21 +913,37 @@ def train_coarse_matching_model(
             lr=lr,
             weight_decay=weight_decay,
         )
-
-        logger.info(f"[Optimizer] normal optimizer, lr={lr}")
+        if logger is not None:
+            logger.info(f"[Optimizer] normal optimizer, lr={lr}")
 
     if resume_path is not None and resume_optimizer:
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
-            logger.info("[Resume] optimizer state loaded.")
+            if logger is not None:
+                logger.info("[Resume] optimizer state loaded.")
         else:
-            logger.info("[Resume] checkpoint has no optimizer state; skip optimizer resume.")
+            if logger is not None:
+                logger.info("[Resume] checkpoint has no optimizer state; skip optimizer resume.")
 
     scaler = GradScaler(enabled=use_amp)
     
     end_epoch = start_epoch + num_epochs - 1
 
+    if is_dist:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=ddp_find_unused_parameters,
+        )
+
     for epoch in range(start_epoch, end_epoch + 1):
+        if is_dist:
+            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(epoch)
+            if hasattr(train_loader, "batch_sampler") and hasattr(train_loader.batch_sampler, "set_epoch"):
+                train_loader.batch_sampler.set_epoch(epoch)
         train_loss = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -843,52 +966,65 @@ def train_coarse_matching_model(
             compute_chunk_match_loss=compute_chunk_match_loss,
             match_sigma=match_sigma,
             match_inside_threshold=match_inside_threshold,
+            is_dist=is_dist,
+            rank=rank,
+            world_size=world_size,
         )
+        if main_process:
+            logger.info(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f}")
 
-        logger.info(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f}")
-
-        save_checkpoint(
-            save_path=os.path.join(save_dir, "latest.pth"),
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            best_val_loss=best_val_loss,
-            model_config=model_config,
-        )
-
-        if val_loader is not None:
-            val_loss = validate_one_epoch(
+            save_checkpoint(
+                save_path=os.path.join(save_dir, "latest.pth"),
                 model=model,
-                loader=val_loader,
-                device=device,
+                optimizer=optimizer,
                 epoch=epoch,
-                use_amp=use_amp,
-                loss_mode=loss_mode,
-                lambda_match=lambda_match,
-                lambda_coord=lambda_coord,
-                lambda_match_kl=lambda_match_kl,
-                lambda_match_ce=lambda_match_ce,
-                lambda_disp=lambda_disp,
-                lambda_smooth=lambda_smooth,
-                lambda_z_spacing=lambda_z_spacing,
-                lambda_disp_mag=lambda_disp_mag,
-                logger=logger,
-                compute_chunk_match_loss=compute_chunk_match_loss,
-                match_sigma=match_sigma,
-                match_inside_threshold=match_inside_threshold,
+                best_val_loss=best_val_loss,
+                model_config=model_config,
             )
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-
-                save_checkpoint(
-                    save_path=os.path.join(save_dir, "best.pth"),
+        if is_dist:
+            dist.barrier()
+        if val_loader is not None:
+            if main_process and val_loader is not None:
+                val_loss = validate_one_epoch(
                     model=model,
-                    optimizer=optimizer,
+                    loader=val_loader,
+                    device=device,
                     epoch=epoch,
-                    best_val_loss=best_val_loss,
-                    model_config=model_config,
+                    use_amp=use_amp,
+                    loss_mode=loss_mode,
+                    lambda_match=lambda_match,
+                    lambda_coord=lambda_coord,
+                    lambda_match_kl=lambda_match_kl,
+                    lambda_match_ce=lambda_match_ce,
+                    lambda_disp=lambda_disp,
+                    lambda_smooth=lambda_smooth,
+                    lambda_z_spacing=lambda_z_spacing,
+                    lambda_disp_mag=lambda_disp_mag,
+                    logger=logger,
+                    compute_chunk_match_loss=compute_chunk_match_loss,
+                    match_sigma=match_sigma,
+                    match_inside_threshold=match_inside_threshold,
                 )
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
 
+                    if logger is not None:
+                        logger.info(f"[Epoch {epoch:03d}] start saving best.pth")
+
+                    save_checkpoint(
+                        save_path=os.path.join(save_dir, "best.pth"),
+                        model=model,
+                        optimizer=optimizer,
+                        epoch=epoch,
+                        best_val_loss=best_val_loss,
+                        model_config=model_config,
+                    )
+
+                    if logger is not None:
+                        logger.info(f"[Epoch {epoch:03d}] finished saving best.pth")
+
+        if is_dist:
+            dist.barrier()
     return model
 
 def clear_gpu_cache(*objs):
@@ -966,8 +1102,19 @@ def overfit_one_sample(
     on one fixed moving/reference pair.
     """
 
+    # ----------------------------------------------------
+    # Distributed / device setup
+    # ----------------------------------------------------
+    is_dist, rank, world_size, local_rank = setup_distributed()
+    main_process = (rank == 0)
+
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            device = f"npu:{local_rank if is_dist else 0}"
+        elif torch.cuda.is_available():
+            device = f"cuda:{local_rank if is_dist else 0}"
+        else:
+            device = "cpu"
 
     device = torch.device(device)
     print(f"[Overfit] device = {device}")

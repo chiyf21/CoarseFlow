@@ -28,6 +28,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 import torch.nn.functional as F
 
 
@@ -1288,4 +1290,434 @@ class CoarseFlowPredictor:
             return phase, weight_acc
         return phase
 
+def sample_ref_by_phase_np(ref_zyx, phase, phase_order="xyz", device="cuda:0"):
+    """
+    ref_zyx:
+        (D,H,W)
 
+    phase:
+        (K,H,W,3)
+        phase_order='xyz': phase[...,0]=x, phase[...,1]=y, phase[...,2]=z
+        phase_order='zyx': phase[...,0]=z, phase[...,1]=y, phase[...,2]=x
+
+    return:
+        mapped_ref: (K,H,W)
+    """
+    ref_np = np.asarray(ref_zyx, dtype=np.float32)
+    phase_np = np.asarray(phase, dtype=np.float32)
+
+    D, Hr, Wr = ref_np.shape
+    K, H, W, C = phase_np.shape
+    assert C == 3
+    assert (H, W) == (Hr, Wr), f"XY mismatch: ref={(Hr, Wr)}, phase={(H, W)}"
+
+    if phase_order == "xyz":
+        x = phase_np[..., 0]
+        y = phase_np[..., 1]
+        z = phase_np[..., 2]
+    elif phase_order == "zyx":
+        z = phase_np[..., 0]
+        y = phase_np[..., 1]
+        x = phase_np[..., 2]
+    else:
+        raise ValueError("phase_order must be 'xyz' or 'zyx'.")
+
+    x_t = torch.from_numpy(x).to(device=device, dtype=torch.float32)
+    y_t = torch.from_numpy(y).to(device=device, dtype=torch.float32)
+    z_t = torch.from_numpy(z).to(device=device, dtype=torch.float32)
+
+    x_norm = 2.0 * x_t / max(Wr - 1, 1) - 1.0
+    y_norm = 2.0 * y_t / max(Hr - 1, 1) - 1.0
+    z_norm = 2.0 * z_t / max(D - 1, 1) - 1.0
+
+    # grid_sample 5D expects grid[..., 0:3] = x,y,z
+    grid = torch.stack([x_norm, y_norm, z_norm], dim=-1)  # (K,H,W,3)
+    grid = grid.unsqueeze(0)                              # (1,K,H,W,3)
+
+    ref_t = torch.from_numpy(ref_np).to(device=device, dtype=torch.float32)
+    ref_t = ref_t[None, None]                             # (1,1,D,H,W)
+
+    mapped = F.grid_sample(
+        ref_t,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
+
+    mapped_np = mapped[0, 0].detach().cpu().numpy()        # (K,H,W)
+    return mapped_np
+
+def make_init_phase_xyz(z_init, H, W):
+    """
+    return:
+        init_phase: (K,H,W,3), order xyz
+    """
+    z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
+    K = len(z_init)
+
+    yy, xx = np.meshgrid(
+        np.arange(H, dtype=np.float32),
+        np.arange(W, dtype=np.float32),
+        indexing="ij",
+    )
+
+    phase = np.zeros((K, H, W, 3), dtype=np.float32)
+    phase[..., 0] = xx[None, :, :]
+    phase[..., 1] = yy[None, :, :]
+    phase[..., 2] = z_init[:, None, None]
+
+    return phase
+
+def mse_np(a, b, mask=None):
+    """
+    a,b: (K,H,W)
+    """
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+
+    err = (a - b) ** 2
+
+    if mask is not None:
+        mask = np.asarray(mask).astype(bool)
+        if mask.sum() == 0:
+            return np.nan
+        return float(err[mask].mean())
+
+    return float(err.mean())
+
+
+def make_init_coords_ctrl_zyx(z_init, Hc, Wc, control_stride=16):
+    """
+    Construct initial control-grid coordinates.
+
+    z_init:
+        (K,)
+
+    return:
+        coords0_ctrl_zyx: (K,Hc,Wc,3), order = z,y,x
+    """
+    z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
+    K = len(z_init)
+
+    y_ctrl = np.arange(Hc, dtype=np.float32) * float(control_stride)
+    x_ctrl = np.arange(Wc, dtype=np.float32) * float(control_stride)
+    yy, xx = np.meshgrid(y_ctrl, x_ctrl, indexing="ij")
+
+    coords0 = np.zeros((K, Hc, Wc, 3), dtype=np.float32)
+    coords0[..., 0] = z_init[:, None, None]
+    coords0[..., 1] = yy[None, :, :]
+    coords0[..., 2] = xx[None, :, :]
+
+    return coords0
+
+
+def masked_mean_np(x, mask=None, eps=1e-8):
+    x = np.asarray(x, dtype=np.float32)
+
+    if mask is None:
+        return float(np.nanmean(x))
+
+    mask = np.asarray(mask).astype(bool)
+
+    if mask.shape != x.shape:
+        raise ValueError(f"mask shape {mask.shape} does not match x shape {x.shape}")
+
+    if mask.sum() == 0:
+        return np.nan
+
+    return float(np.nanmean(x[mask]))
+
+
+def compute_coord_metrics_ctrl(
+    pred_coords_ctrl_zyx,
+    gt_coords_ctrl_zyx,
+    z_init,
+    valid_mask_ctrl=None,
+    control_stride=16,
+):
+    """
+    Compare predicted control-grid coordinates with GT coordinates.
+
+    pred_coords_ctrl_zyx:
+        (K,Hc,Wc,3), order z,y,x
+
+    gt_coords_ctrl_zyx:
+        (K,Hc,Wc,3), order z,y,x
+
+    valid_mask_ctrl:
+        optional, (K,Hc,Wc)
+
+    return:
+        dict of coordinate metrics.
+    """
+    pred = np.asarray(pred_coords_ctrl_zyx, dtype=np.float32)
+    gt = np.asarray(gt_coords_ctrl_zyx, dtype=np.float32)
+
+    if pred.shape != gt.shape:
+        raise ValueError(f"pred shape {pred.shape} != gt shape {gt.shape}")
+
+    K, Hc, Wc, _ = pred.shape
+
+    init = make_init_coords_ctrl_zyx(
+        z_init=z_init,
+        Hc=Hc,
+        Wc=Wc,
+        control_stride=control_stride,
+    )
+
+    if valid_mask_ctrl is not None:
+        valid = np.asarray(valid_mask_ctrl).astype(bool)
+        if valid.shape != (K, Hc, Wc):
+            raise ValueError(
+                f"valid_mask_ctrl shape {valid.shape} != expected {(K,Hc,Wc)}"
+            )
+    else:
+        valid = None
+
+    err_pred = pred - gt
+    err_init = init - gt
+
+    # L1 in z,y,x
+    l1_pred = np.abs(err_pred).sum(axis=-1)
+    l1_init = np.abs(err_init).sum(axis=-1)
+
+    # L2 in z,y,x
+    l2_pred = np.linalg.norm(err_pred, axis=-1)
+    l2_init = np.linalg.norm(err_init, axis=-1)
+
+    # z error
+    z_abs_pred = np.abs(err_pred[..., 0])
+    z_abs_init = np.abs(err_init[..., 0])
+
+    # xy error
+    xy_l2_pred = np.linalg.norm(err_pred[..., 1:3], axis=-1)
+    xy_l2_init = np.linalg.norm(err_init[..., 1:3], axis=-1)
+
+    coord_l1_pred = masked_mean_np(l1_pred, valid)
+    coord_l1_init = masked_mean_np(l1_init, valid)
+
+    coord_l2_pred = masked_mean_np(l2_pred, valid)
+    coord_l2_init = masked_mean_np(l2_init, valid)
+
+    z_abs_pred_mean = masked_mean_np(z_abs_pred, valid)
+    z_abs_init_mean = masked_mean_np(z_abs_init, valid)
+
+    xy_l2_pred_mean = masked_mean_np(xy_l2_pred, valid)
+    xy_l2_init_mean = masked_mean_np(xy_l2_init, valid)
+
+    return {
+        # absolute error
+        "coord_l1_init": coord_l1_init,
+        "coord_l1_pred": coord_l1_pred,
+        "coord_l2_init": coord_l2_init,
+        "coord_l2_pred": coord_l2_pred,
+        "z_abs_init": z_abs_init_mean,
+        "z_abs_pred": z_abs_pred_mean,
+        "xy_l2_init": xy_l2_init_mean,
+        "xy_l2_pred": xy_l2_pred_mean,
+
+        # improvement: positive means prediction is better than init
+        "coord_l1_improvement": coord_l1_init - coord_l1_pred,
+        "coord_l2_improvement": coord_l2_init - coord_l2_pred,
+        "z_abs_improvement": z_abs_init_mean - z_abs_pred_mean,
+        "xy_l2_improvement": xy_l2_init_mean - xy_l2_pred_mean,
+
+        # relative improvement
+        "coord_l1_relative_improvement": (
+            coord_l1_init - coord_l1_pred
+        ) / (coord_l1_init + 1e-8),
+        "coord_l2_relative_improvement": (
+            coord_l2_init - coord_l2_pred
+        ) / (coord_l2_init + 1e-8),
+        "xy_l2_relative_improvement": (
+            xy_l2_init_mean - xy_l2_pred_mean
+        ) / (xy_l2_init_mean + 1e-8),
+    }
+
+def extract_gt_coords_from_batch_item(
+    batch,
+    b,
+    z_init,
+    pred_coords_ctrl_zyx,
+    control_stride=16,
+):
+    """
+    Return:
+        gt_coords_ctrl_zyx or None
+        valid_mask_ctrl or None
+    """
+    K, Hc, Wc, _ = pred_coords_ctrl_zyx.shape
+
+    gt_coords = None
+
+    if "gt_coords" in batch:
+        gt_coords = batch["gt_coords"][b].detach().cpu().numpy().astype(np.float32)
+
+    elif "gt_coords_ctrl" in batch:
+        gt_coords = batch["gt_coords_ctrl"][b].detach().cpu().numpy().astype(np.float32)
+
+    elif "gt_disp" in batch:
+        gt_disp = batch["gt_disp"][b].detach().cpu().numpy().astype(np.float32)
+
+        coords0 = make_init_coords_ctrl_zyx(
+            z_init=z_init,
+            Hc=Hc,
+            Wc=Wc,
+            control_stride=control_stride,
+        )
+
+        gt_coords = coords0 + gt_disp
+
+    else:
+        gt_coords = None
+
+    valid_mask = None
+
+    if "valid_mask" in batch:
+        valid_mask = batch["valid_mask"][b].detach().cpu().numpy().astype(bool)
+
+    elif "valid" in batch:
+        valid_mask = batch["valid"][b].detach().cpu().numpy().astype(bool)
+
+    return gt_coords, valid_mask
+
+
+def evaluate_one_sample_with_predictor(
+    predictor,
+    mov_zyx,
+    ref_zyx,
+    z_init,
+    ref_spacing=(1.0, 1.0, 1.0),
+    normalize=True,
+    phase_order="xyz",
+    use_patchwise=False,
+    patchwise_kwargs=None,
+
+    # new
+    gt_coords_ctrl_zyx=None,
+    valid_mask_ctrl=None,
+):
+    """
+    mov_zyx: (K,H,W)
+    ref_zyx: (D,H,W)
+    z_init:  (K,)
+
+    gt_coords_ctrl_zyx:
+        optional, (K,Hc,Wc,3), order z,y,x
+
+    valid_mask_ctrl:
+        optional, (K,Hc,Wc)
+
+    return:
+        dict with image-level MSE metrics and coordinate metrics.
+    """
+    mov_zyx = np.asarray(mov_zyx, dtype=np.float32)
+    ref_zyx = np.asarray(ref_zyx, dtype=np.float32)
+    z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
+
+    K, H, W = mov_zyx.shape
+
+    if normalize:
+        mov_eval = percentile_normalize_01_np(mov_zyx)
+        ref_eval = percentile_normalize_01_np(ref_zyx)
+    else:
+        mov_eval = mov_zyx
+        ref_eval = ref_zyx
+
+    if use_patchwise:
+        if patchwise_kwargs is None:
+            patchwise_kwargs = {}
+
+        pred_phase = predictor.predict_patchwise(
+            mov=mov_eval,
+            ref=ref_eval,
+            z_init=z_init,
+            ref_spacing=ref_spacing,
+            mov_order="zyx",
+            ref_order="zyx",
+            normalize=False,
+            phase_order=phase_order,
+            verbose=False,
+            **patchwise_kwargs,
+        )
+
+        # patchwise 当前只返回 dense phase，不返回 control-grid pred_coords
+        pred_coords_ctrl_zyx = None
+
+    else:
+        pred_out = predictor.predict_full(
+            mov=mov_eval,
+            ref=ref_eval,
+            z_init=z_init,
+            ref_spacing=ref_spacing,
+            mov_order="zyx",
+            ref_order="zyx",
+            normalize=False,
+            phase_order=phase_order,
+            return_dict=True,
+        )
+
+        pred_phase = pred_out["phase"]
+        pred_coords_ctrl_zyx = pred_out.get("pred_coords_ctrl_zyx", None)
+
+    init_phase = make_init_phase_xyz(z_init=z_init, H=H, W=W)
+
+    mapped_init = sample_ref_by_phase_np(
+        ref_eval,
+        init_phase,
+        phase_order="xyz",
+        device=str(predictor.device),
+    )
+
+    mapped_pred = sample_ref_by_phase_np(
+        ref_eval,
+        pred_phase,
+        phase_order=phase_order,
+        device=str(predictor.device),
+    )
+
+    mse_init = mse_np(mapped_init, mov_eval)
+    mse_pred = mse_np(mapped_pred, mov_eval)
+
+    delta_mse = mse_init - mse_pred
+
+    # 推荐主要看这个比例
+    relative_mse_improvement = delta_mse / (mse_init + 1e-8)
+
+    result = {
+        "mse_init": mse_init,
+        "mse_pred": mse_pred,
+        "delta_mse": delta_mse,
+
+        # new: positive means improved
+        "relative_mse_improvement": relative_mse_improvement,
+
+        # optional: lower is better
+        "mse_ratio_pred_over_init": mse_pred / (mse_init + 1e-8),
+
+        "pred_phase": pred_phase,
+        "init_phase": init_phase,
+        "mapped_init": mapped_init,
+        "mapped_pred": mapped_pred,
+        "mov_eval": mov_eval,
+        "ref_eval": ref_eval,
+    }
+
+    # ----------------------------------------------------
+    # Coordinate metrics
+    # ----------------------------------------------------
+    if (gt_coords_ctrl_zyx is not None) and (pred_coords_ctrl_zyx is not None):
+        control_stride = int(predictor.model_config.get("control_stride", 16))
+
+        coord_metrics = compute_coord_metrics_ctrl(
+            pred_coords_ctrl_zyx=pred_coords_ctrl_zyx,
+            gt_coords_ctrl_zyx=gt_coords_ctrl_zyx,
+            z_init=z_init,
+            valid_mask_ctrl=valid_mask_ctrl,
+            control_stride=control_stride,
+        )
+
+        result.update(coord_metrics)
+
+    return result

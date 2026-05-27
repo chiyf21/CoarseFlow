@@ -930,6 +930,60 @@ def load_dataset_from_manifest(manifest_path: str) -> Tuple[ConcatDataset, List[
     concat_dataset = ConcatDataset(datasets)
     return concat_dataset, part_infos
 
+def get_rank_world_size_from_env(
+    distributed: bool = False,
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
+) -> Tuple[int, int]:
+    """
+    Get DDP rank/world_size from torchrun environment.
+
+    This does not require dist.init_process_group().
+    It only reads environment variables set by torchrun.
+    """
+    if rank is not None and world_size is not None:
+        return int(rank), int(world_size)
+
+    if distributed or ("RANK" in os.environ and "WORLD_SIZE" in os.environ):
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        return rank, world_size
+
+    return 0, 1
+
+
+def shard_batches_for_ddp(
+    batches: List[List[int]],
+    rank: int = 0,
+    world_size: int = 1,
+    pad_to_equal: bool = True,
+) -> List[List[int]]:
+    """
+    Split a global batch list across DDP ranks.
+
+    Important:
+        DDP requires each rank to run the same number of iterations.
+        If len(batches) is not divisible by world_size, we pad by repeating
+        several batches so that every rank has the same number of steps.
+    """
+    rank = int(rank)
+    world_size = int(world_size)
+
+    if world_size <= 1:
+        return batches
+
+    if len(batches) == 0:
+        return []
+
+    if pad_to_equal:
+        remainder = len(batches) % world_size
+        if remainder != 0:
+            pad_num = world_size - remainder
+            batches = batches + batches[:pad_num]
+
+    return batches[rank::world_size]
+
+
 
 # ============================================================
 # Same-K batch sampler and dataloader builder
@@ -954,6 +1008,11 @@ class SameKBatchSampler(Sampler[List[int]]):
         batch_size: int = 4,
         shuffle: bool = True,
         drop_last: bool = False,
+        distributed: bool = False,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None,
+        seed: int = 0,
+        pad_to_equal_batches: bool = True,
     ):
         self.part_infos = list(part_infos)
         self.batch_size = int(batch_size)
@@ -968,22 +1027,47 @@ class SameKBatchSampler(Sampler[List[int]]):
 
         self.batches: List[List[int]] = []
         self._build_batches()
+        self.distributed = bool(distributed)
+        self.rank, self.world_size = get_rank_world_size_from_env(
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+        )
+        self.seed = int(seed)
+        self.epoch = 0
+        self.pad_to_equal_batches = bool(pad_to_equal_batches)
+        self.global_batches = []
 
     def _build_batches(self) -> None:
-        self.batches = []
+        rng = random.Random(self.seed + self.epoch)
+
+        global_batches = []
+
         for K, indices in self.groups.items():
             idx = list(indices)
+
             if self.shuffle:
-                random.shuffle(idx)
+                rng.shuffle(idx)
 
             for i in range(0, len(idx), self.batch_size):
                 batch = idx[i:i + self.batch_size]
+
                 if len(batch) < self.batch_size and self.drop_last:
                     continue
-                self.batches.append(batch)
+
+                global_batches.append(batch)
 
         if self.shuffle:
-            random.shuffle(self.batches)
+            rng.shuffle(global_batches)
+
+        self.global_batches = global_batches
+
+        self.batches = shard_batches_for_ddp(
+            global_batches,
+            rank=self.rank,
+            world_size=self.world_size,
+            pad_to_equal=self.pad_to_equal_batches,
+        )
 
     def __iter__(self):
         self._build_batches()
@@ -993,6 +1077,9 @@ class SameKBatchSampler(Sampler[List[int]]):
     def __len__(self) -> int:
         return len(self.batches)
 
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+        self._build_batches()
 
 def build_sameK_loader(
     manifest_path: str,
@@ -1001,6 +1088,11 @@ def build_sameK_loader(
     num_workers: int = 0,
     pin_memory: bool = True,
     drop_last: bool = False,
+    distributed: bool = False,
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
+    seed: int = 0,
+    pad_to_equal_batches: bool = True,
 ) -> Tuple[DataLoader, ConcatDataset, List[Dict[str, Any]]]:
     """Build a DataLoader whose batches contain only samples with the same K."""
     dataset, part_infos = load_dataset_from_manifest(manifest_path)
@@ -1010,6 +1102,11 @@ def build_sameK_loader(
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        seed=seed,
+        pad_to_equal_batches=pad_to_equal_batches,
     )
 
     loader = DataLoader(
@@ -1029,6 +1126,11 @@ def build_sameShape_loader(
     pin_memory: bool = True,
     drop_last: bool = False,
     verbose: bool = True,
+    distributed: bool = False,
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
+    seed: int = 0,
+    pad_to_equal_batches: bool = True,
 ) -> Tuple[DataLoader, ConcatDataset, List[Dict[str, Any]]]:
     """
     Build a DataLoader whose batches contain samples with the same:
@@ -1044,6 +1146,11 @@ def build_sameShape_loader(
         shuffle=shuffle,
         drop_last=drop_last,
         verbose=verbose,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        seed=seed,
+        pad_to_equal_batches=pad_to_equal_batches,
     )
 
     loader = DataLoader(
@@ -1101,13 +1208,18 @@ class SameShapeBatchSampler(Sampler[List[int]]):
     Required for default_collate to stack tensors.
     """
 
-    def __init__(
+    def  __init__(
         self,
         dataset: Dataset,
         batch_size: int = 4,
         shuffle: bool = True,
         drop_last: bool = False,
         verbose: bool = True,
+        distributed: bool = False,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None,
+        seed: int = 0,
+        pad_to_equal_batches: bool = True,
     ):
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -1115,8 +1227,20 @@ class SameShapeBatchSampler(Sampler[List[int]]):
         self.drop_last = bool(drop_last)
         self.verbose = bool(verbose)
 
+        self.distributed = bool(distributed)
+        self.rank, self.world_size = get_rank_world_size_from_env(
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+        )
+        self.seed = int(seed)
+        self.epoch = 0
+        self.pad_to_equal_batches = bool(pad_to_equal_batches)
+
         self.groups = {}
         self._scan_dataset_shapes()
+
+        self.global_batches = []
         self.batches = []
         self._build_batches()
 
@@ -1155,13 +1279,15 @@ class SameShapeBatchSampler(Sampler[List[int]]):
                 print(f"  key=(K,D,H,W)={key}, n={len(indices)}")
 
     def _build_batches(self):
-        self.batches = []
+        rng = random.Random(self.seed + self.epoch)
+
+        global_batches = []
 
         for key, indices in self.groups.items():
             idx = list(indices)
 
             if self.shuffle:
-                random.shuffle(idx)
+                rng.shuffle(idx)
 
             for i in range(0, len(idx), self.batch_size):
                 batch = idx[i:i + self.batch_size]
@@ -1169,10 +1295,19 @@ class SameShapeBatchSampler(Sampler[List[int]]):
                 if len(batch) < self.batch_size and self.drop_last:
                     continue
 
-                self.batches.append(batch)
+                global_batches.append(batch)
 
         if self.shuffle:
-            random.shuffle(self.batches)
+            rng.shuffle(global_batches)
+
+        self.global_batches = global_batches
+
+        self.batches = shard_batches_for_ddp(
+            global_batches,
+            rank=self.rank,
+            world_size=self.world_size,
+            pad_to_equal=self.pad_to_equal_batches,
+        )
 
     def __iter__(self):
         self._build_batches()
