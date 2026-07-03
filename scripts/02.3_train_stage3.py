@@ -1,4 +1,4 @@
-# scripts/train_stage1_npu.py
+# Stage 3: More difficult data + sharpen — harder data, resume from Stage 2
 
 import os
 import sys
@@ -42,7 +42,7 @@ def main():
     # ------------------------------------------------------------
     if is_main:
         print("=" * 80)
-        print("[Stage 1 NPU Training]")
+        print("[Stage 3] More difficult data + sharpen — resume from Stage 2
         print(f"PROJECT_ROOT = {PROJECT_ROOT}")
         print(f"rank         = {rank}")
         print(f"local_rank   = {local_rank}")
@@ -70,7 +70,7 @@ def main():
     # ------------------------------------------------------------
     # Model config
     # ------------------------------------------------------------
-    model_config_v6 = dict(
+    model_config = dict(
         # =====================================================
         # Core
         # =====================================================
@@ -145,7 +145,7 @@ def main():
         residual_detach_features=True,
     )
 
-    model_config_stage1 = dict(model_config_v6)
+    model_config = dict(model_config)
 
     # ------------------------------------------------------------
     # DataLoader
@@ -154,7 +154,7 @@ def main():
     #   global batch size = batch_size * world_size.
     # ------------------------------------------------------------
     train_loader_stage3, _, _ = build_sameShape_loader(
-        manifest_summary["stage3.1_train"],
+        manifest_summary["stage3_train"],
         batch_size=3,
         shuffle=True,
         num_workers=0,
@@ -173,7 +173,7 @@ def main():
     # Validation only on rank 0.
     if is_main:
         val_loader_stage3, _, _ = build_sameShape_loader(
-            manifest_summary["stage3.1_val"],
+            manifest_summary["stage3_val"],
             batch_size=1,
             shuffle=False,
             num_workers=0,
@@ -185,48 +185,34 @@ def main():
         )
     else:
         val_loader_stage3 = None
-    # if is_main:
-    #     print(
-    #         f"[DEBUG] len(train_loader_stage3) = {len(train_loader_stage3)}",
-    #         flush=True,
-    #     )
-    #     print(
-    #         f"[DEBUG] len(val_loader_stage3) = {len(val_loader_stage3)}",
-    #         flush=True,
-    #     )
-    # else:
-    #     print(
-    #         f"[DEBUG] rank={rank}, len(train_loader_stage3) = {len(train_loader_stage3)}, val_loader=None",
-    #         flush=True,
-    #     )
     # ------------------------------------------------------------
     # Train
     # ------------------------------------------------------------
-    model_stage1 = train_coarse_matching_model(
+    model = train_coarse_matching_model(
         train_dataset=None,
         val_dataset=None,
         train_loader=train_loader_stage3,
         val_loader=val_loader_stage3,
 
-        save_dir="checkpoints/coarseflow_v7_stage3.1_iter3_sharpen",
+        save_dir="checkpoints/coarseflow_v7_stage3_More_difficult_data_sharpen",
 
         num_epochs=600,
-        lr=2e-5,
+        lr=1e-5,
         weight_decay=1e-4,
         batch_size=3,
         num_workers=0,
 
         use_amp=False,
 
-        **model_config_stage1,
+        **model_config,
 
         loss_mode="match",
 
-        lambda_match=0.9,
-        lambda_match_kl=0.1,
-        lambda_match_ce=0.9,
+        lambda_match=1.0,
+        lambda_match_kl=0.15,
+        lambda_match_ce=0.85,
 
-        lambda_coord=0.7,
+        lambda_coord=0.6,
         lambda_disp=0.0,
 
         lambda_smooth=0.005,
@@ -237,7 +223,7 @@ def main():
         match_sigma=(0.4, 0.6, 0.6),
         match_inside_threshold=4.0,
 
-        resume_path="checkpoints/coarseflow_v7_stage3.1_iter3_sharpen/best.pth",
+        resume_path="checkpoints/coarseflow_v7_stage2_K5_sharpen/best.pth",
         resume_optimizer=False,
         resume_best_val_loss=False,
         strict_load=True,
@@ -245,9 +231,8 @@ def main():
         log_filename="train.log",
         log_mode="a",
     )
-    
     if is_main:
-        print("[Done] Stage 1 training finished.")
+        print("[Done] Stage 3 training finished.")
 
 
 if __name__ == "__main__":

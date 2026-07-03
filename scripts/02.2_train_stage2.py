@@ -1,4 +1,4 @@
-# scripts/train_stage1_npu.py
+# Stage 2: Sharpen training — K=5, increased coord weight, resume from Stage 1
 
 import os
 import sys
@@ -42,7 +42,7 @@ def main():
     # ------------------------------------------------------------
     if is_main:
         print("=" * 80)
-        print("[Stage 1 NPU Training]")
+        print("[Stage 2] Sharpen — K=5, higher coord weight, resume from Stage 1")
         print(f"PROJECT_ROOT = {PROJECT_ROOT}")
         print(f"rank         = {rank}")
         print(f"local_rank   = {local_rank}")
@@ -70,7 +70,7 @@ def main():
     # ------------------------------------------------------------
     # Model config
     # ------------------------------------------------------------
-    model_config_v6 = dict(
+    model_config = dict(
         # =====================================================
         # Core
         # =====================================================
@@ -145,7 +145,7 @@ def main():
         residual_detach_features=True,
     )
 
-    model_config_stage1 = dict(model_config_v6)
+    model_config = dict(model_config)
 
     # ------------------------------------------------------------
     # DataLoader
@@ -185,68 +185,10 @@ def main():
         )
     else:
         val_loader_stage3 = None
-    # if is_main:
-    #     print(
-    #         f"[DEBUG] len(train_loader_stage3) = {len(train_loader_stage3)}",
-    #         flush=True,
-    #     )
-    #     print(
-    #         f"[DEBUG] len(val_loader_stage3) = {len(val_loader_stage3)}",
-    #         flush=True,
-    #     )
-    # else:
-    #     print(
-    #         f"[DEBUG] rank={rank}, len(train_loader_stage3) = {len(train_loader_stage3)}, val_loader=None",
-    #         flush=True,
-    #     )
     # ------------------------------------------------------------
     # Train
     # ------------------------------------------------------------
-    # model_stage1 = train_coarse_matching_model(
-    #     train_dataset=None,
-    #     val_dataset=None,
-    #     train_loader=train_loader_stage3,
-    #     val_loader=val_loader_stage3,
-
-    #     save_dir="checkpoints/coarseflow_v7_stage2_K5_sharpen",
-
-    #     num_epochs=300,
-    #     lr=2e-5,
-    #     weight_decay=1e-4,
-    #     batch_size=4,
-    #     num_workers=0,
-
-    #     # 建议先 False，等单卡/多卡都稳定后再尝试 True
-    #     use_amp=False,
-
-    #     **model_config_stage1,
-
-    #     loss_mode="match",
-
-    #     lambda_match=1.0,
-    #     lambda_match_kl=0.2,
-    #     lambda_match_ce=0.8,
-
-    #     lambda_coord=0.5,
-    #     lambda_disp=0.0,
-
-    #     lambda_smooth=0.005,
-    #     lambda_z_spacing=0.00,
-    #     lambda_disp_mag=0.2,
-
-    #     compute_chunk_match_loss=True,
-    #     match_sigma=(0.4, 0.6, 0.6),
-    #     match_inside_threshold=4.0,
-
-    #     resume_path="checkpoints/coarseflow_v7_stage1_K5_varSpacing_iter1_attn6_npu_ddp/best.pth",
-    #     resume_optimizer=False,
-    #     resume_best_val_loss=False,
-    #     strict_load=True,
-
-    #     log_filename="train.log",
-    #     log_mode="w",
-    # )
-    model_stage1 = train_coarse_matching_model(
+    model = train_coarse_matching_model(
         train_dataset=None,
         val_dataset=None,
         train_loader=train_loader_stage3,
@@ -262,7 +204,7 @@ def main():
 
         use_amp=False,
 
-        **model_config_stage1,
+        **model_config,
 
         loss_mode="match",
 
@@ -281,7 +223,7 @@ def main():
         match_sigma=(0.4, 0.6, 0.6),
         match_inside_threshold=4.0,
 
-        resume_path="checkpoints/coarseflow_v7_stage2_K5_sharpen/best.pth",
+        resume_path="checkpoints/coarseflow_v7_stage1_K5_varSpacing_iter1_attn6_npu_ddp/best.pth",
         resume_optimizer=False,
         resume_best_val_loss=False,
         strict_load=True,
@@ -290,7 +232,7 @@ def main():
         log_mode="a",
     )
     if is_main:
-        print("[Done] Stage 1 training finished.")
+        print("[Done] Stage 2 training finished.")
 
 
 if __name__ == "__main__":

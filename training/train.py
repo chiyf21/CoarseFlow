@@ -17,12 +17,7 @@ except Exception:
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from models.SparseGMFlow3D import (
-    CoarseMatchingNetV3,
-    CoarseMatchingNetV4,
-    CoarseMatchingNetV5,
-)
-from models.SparseGMFlow3D_v2 import CoarseMatchingNetV6,count_parameters_by_module,count_parameters
+from models.SparseGMFlow3D import CoarseMatchingNet, count_parameters_by_module, count_parameters
 from training.losses import total_coarse_loss
 import logging
 import sys
@@ -779,7 +774,7 @@ def train_coarse_matching_model(
 
     )
     
-    model = CoarseMatchingNetV6(**model_config).to(device)
+    model = CoarseMatchingNet(**model_config).to(device)
     count_parameters(model)
     count_parameters_by_module(model, max_depth=1)
     best_val_loss = float("inf")
@@ -1172,7 +1167,7 @@ def overfit_one_sample(
     # -------------------------
     # 2. Build model
     # -------------------------
-    model = CoarseMatchingNetV6(
+    model = CoarseMatchingNet(
         dim=dim,
         radius=radius,
         temperature=temperature,
@@ -1624,7 +1619,7 @@ def inference(
 
     Args:
         model:
-            trained CoarseMatchingNetV3.
+            trained CoarseMatchingNet.
 
         sample_or_batch:
             Either:
@@ -2381,7 +2376,7 @@ def load_coarse_model_from_pth(
     strict=True,
 ):
     """
-    Load CoarseMatchingNetV5 from checkpoint.
+    Load CoarseMatchingNet from checkpoint.
 
     If checkpoint contains "model_config", use it.
     Otherwise use provided model_config.
@@ -2434,7 +2429,7 @@ def load_coarse_model_from_pth(
                 use_coord_residual=False,
             )
 
-    model = CoarseMatchingNetV6(**model_config).to(device)
+    model = CoarseMatchingNet(**model_config).to(device)
 
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
 

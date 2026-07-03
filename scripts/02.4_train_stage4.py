@@ -1,4 +1,4 @@
-# scripts/train_stage4_spatial_residual_npu.py
+# Stage 4: More data + sharpen — stage3.1 data, resume from Stage 3
 
 import os
 import sys
@@ -42,7 +42,7 @@ def main():
     # ------------------------------------------------------------
     if is_main:
         print("=" * 80)
-        print("[Stage 4 Spatial Residual Refinement NPU Training]")
+        print("[Stage 4] More data + sharpen — resume from Stage 3")
         print(f"PROJECT_ROOT = {PROJECT_ROOT}")
         print(f"rank         = {rank}")
         print(f"local_rank   = {local_rank}")
@@ -67,21 +67,10 @@ def main():
             print(name)
             summarize_manifest(path)
 
-
-    # ------------------------------------------------------------
-    # Stage-4 residual-refinement settings
-    # ------------------------------------------------------------
-    # Keep the coarse V6 matcher at one refinement iteration to avoid
-    # the large memory increase from iterative matching. The new spatial
-    # residual head is trained on top of the existing coarse checkpoint.
-    PER_NPU_BATCH_SIZE = 4
-    VAL_BATCH_SIZE = 1
-    TRAIN_ONLY_RESIDUAL = True
-
     # ------------------------------------------------------------
     # Model config
     # ------------------------------------------------------------
-    model_config_v6 = dict(
+    model_config = dict(
         # =====================================================
         # Core
         # =====================================================
@@ -95,7 +84,7 @@ def main():
         encoder_stride=8,
 
         num_refine_iters=1,
-        query_chunk_size=256,
+        query_chunk_size=512,
 
         # =====================================================
         # Moving encoder
@@ -143,36 +132,20 @@ def main():
         matcher_init_gamma=1e-2,
 
         # =====================================================
-        # Spatial coordinate residual refinement: ON for Stage 4
+        # Residual refinement: OFF for Stage 1
         # =====================================================
-        # Keep num_refine_iters=1 above. This avoids the memory increase
-        # from running the full local matcher 2-3 times. The residual head
-        # learns a small continuous correction after the /8 coarse match.
-        use_coord_residual=True,
+        use_coord_residual=False,
         residual_type="spatial",
-
-        # 128 hidden dim + 3 blocks is deliberately lighter than the
-        # previous 256 dim + 5 blocks setting, and is safer for inference.
-        residual_hidden_dim=128,
-        residual_num_blocks=3,
-
-        # V6 matches on /8 XY features, so allow several raw-pixel XY
-        # correction pixels to compensate for coarse-grid quantization.
-        residual_max_delta=(2.0, 8.0, 8.0),
-
+        residual_hidden_dim=256,
+        residual_num_blocks=5,
+        residual_max_delta=(1.5, 3.0, 3.0),
         residual_use_disp=True,
-
-        # False uses kernel=(1,3,3) inside the spatial residual head.
-        # This reduces memory/compute compared with full 3D residual convs.
-        residual_use_3d=False,
-
-        # Detach coarse outputs/features so the residual stage behaves like
-        # a lightweight calibrator on top of the trained coarse V6 model.
+        residual_use_3d=True,
         residual_detach_coarse=True,
         residual_detach_features=True,
     )
 
-    model_config_stage1 = dict(model_config_v6)
+    model_config = dict(model_config)
 
     # ------------------------------------------------------------
     # DataLoader
@@ -182,7 +155,7 @@ def main():
     # ------------------------------------------------------------
     train_loader_stage3, _, _ = build_sameShape_loader(
         manifest_summary["stage3.1_train"],
-        batch_size=PER_NPU_BATCH_SIZE,
+        batch_size=3,
         shuffle=True,
         num_workers=0,
         pin_memory=False,
@@ -201,7 +174,7 @@ def main():
     if is_main:
         val_loader_stage3, _, _ = build_sameShape_loader(
             manifest_summary["stage3.1_val"],
-            batch_size=VAL_BATCH_SIZE,
+            batch_size=1,
             shuffle=False,
             num_workers=0,
             pin_memory=False,
@@ -235,55 +208,46 @@ def main():
         train_loader=train_loader_stage3,
         val_loader=val_loader_stage3,
 
-        save_dir="checkpoints/coarseflow_v7_stage4_spatial_residual",
+        save_dir="checkpoints/coarseflow_v7_stage4_MoreData_sharpen",
 
         num_epochs=600,
-        lr=1e-4,
+        lr=2e-5,
         weight_decay=1e-4,
-        batch_size=PER_NPU_BATCH_SIZE,
+        batch_size=3,
         num_workers=0,
 
         use_amp=False,
 
-        **model_config_stage1,
+        **model_config,
 
-        # Residual stage should be driven mainly by coordinate/displacement
-        # supervision, not by re-training the coarse match distribution.
-        # If your train.py only supports loss_mode="match", keep this line
-        # unchanged and rely on the lambda values below.
-        loss_mode="coord",
+        loss_mode="match",
 
-        lambda_match=0.0,
-        lambda_match_kl=0.0,
-        lambda_match_ce=0.0,
+        lambda_match=0.9,
+        lambda_match_kl=0.1,
+        lambda_match_ce=0.9,
 
-        lambda_coord=1.0,
-        lambda_disp=0.2,
+        lambda_coord=0.7,
+        lambda_disp=0.0,
 
-        lambda_smooth=0.01,
+        lambda_smooth=0.005,
         lambda_z_spacing=0.00,
-        lambda_disp_mag=0.0,
+        lambda_disp_mag=0.1,
 
-        compute_chunk_match_loss=False,
+        compute_chunk_match_loss=True,
         match_sigma=(0.4, 0.6, 0.6),
         match_inside_threshold=4.0,
 
-        resume_path="checkpoints/coarseflow_v7_stage3.1_iter3_sharpen/best.pth",
+        resume_path="checkpoints/coarseflow_v7_stage3_More_difficult_data_sharpen/best.pth",
         resume_optimizer=False,
         resume_best_val_loss=False,
-        strict_load=False,
-
-        # This requires train_coarse_matching_model to support freezing all
-        # non-residual parameters. If your train.py does not have this option,
-        # remove this line and freeze modules manually in train.py.
-        train_only_residual=TRAIN_ONLY_RESIDUAL,
+        strict_load=True,
 
         log_filename="train.log",
         log_mode="a",
     )
     
     if is_main:
-        print("[Done] Stage 4 spatial residual refinement finished.")
+        print("[Done] Stage 4 training finished.")
 
 
 if __name__ == "__main__":

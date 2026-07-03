@@ -28,8 +28,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-import torch_npu
-from torch_npu.contrib import transfer_to_npu
 import torch.nn.functional as F
 
 
@@ -49,7 +47,7 @@ def get_device(device: Optional[Union[str, torch.device]] = None) -> torch.devic
 
 def import_model_class(
     model_module: str = "CoarseFlow.models.SparseGMFlow3D",
-    model_class: str = "CoarseMatchingNetV5",
+    model_class: str = "CoarseMatchingNet",
 ):
     """
     Dynamically import model class.
@@ -57,12 +55,12 @@ def import_model_class(
     Examples:
         model_cls = import_model_class(
             model_module="CoarseFlow.models.SparseGMFlow3D",
-            model_class="CoarseMatchingNetV5",
+            model_class="CoarseMatchingNet",
         )
 
         model_cls = import_model_class(
-            model_module="CoarseFlow.models.SparseGMFlow3D_final",
-            model_class="CoarseMatchingNetFinal",
+            model_module="CoarseFlow.models.SparseGMFlow3D",
+            model_class="CoarseMatchingNet",
         )
     """
     module = importlib.import_module(model_module)
@@ -171,7 +169,7 @@ def load_coarseflow_model_from_pth(
     pth_path: str,
     model_config: Optional[Dict[str, Any]] = None,
     model_module: str = "CoarseFlow.models.SparseGMFlow3D",
-    model_class: str = "CoarseMatchingNetV5",
+    model_class: str = "CoarseMatchingNet",
     device: Optional[Union[str, torch.device]] = None,
     strict: bool = True,
     state_key: str = "model",
@@ -187,7 +185,7 @@ def load_coarseflow_model_from_pth(
         model_module:
             Python module containing the model class.
         model_class:
-            Model class name, e.g. 'CoarseMatchingNetV5', 'CoarseMatchingNetV6'.
+            Model class name, e.g. 'CoarseMatchingNet', 'CoarseMatchingNet'.
         strict:
             Passed to model.load_state_dict.
         state_key:
@@ -505,7 +503,7 @@ def predict_phase_from_images(
     pth_path: str,
     model_config: Optional[Dict[str, Any]] = None,
     model_module: str = "CoarseFlow.models.SparseGMFlow3D",
-    model_class: str = "CoarseMatchingNetV5",
+    model_class: str = "CoarseMatchingNet",
     device: Optional[Union[str, torch.device]] = None,
     mov_order: str = "zyx",
     ref_order: str = "zyx",
@@ -757,7 +755,7 @@ def predict_phase_patchwise_large_volume(
     pth_path: str,
     model_config: Optional[Dict[str, Any]] = None,
     model_module: str = "CoarseFlow.models.SparseGMFlow3D",
-    model_class: str = "CoarseMatchingNetV5",
+    model_class: str = "CoarseMatchingNet",
     device: Optional[Union[str, torch.device]] = None,
     mov_order: str = "zyx",
     ref_order: str = "zyx",
@@ -1049,7 +1047,7 @@ class CoarseFlowInferenceConfig:
     pth_path: str
     model_config: Optional[Dict[str, Any]] = None
     model_module: str = "CoarseFlow.models.SparseGMFlow3D"
-    model_class: str = "CoarseMatchingNetV5"
+    model_class: str = "CoarseMatchingNet"
     device: Optional[Union[str, torch.device]] = None
     strict_load: bool = True
     use_amp: bool = True
@@ -1290,71 +1288,31 @@ class CoarseFlowPredictor:
             return phase, weight_acc
         return phase
 
-def sample_ref_by_phase_np(ref_zyx, phase, phase_order="xyz", device="cuda:0"):
+
+# =============================================================================
+# Coarse + refine evaluation utilities
+# =============================================================================
+
+import copy
+
+
+def make_init_phase_xyz_from_z_init(z_init, image_shape_yx):
     """
-    ref_zyx:
-        (D,H,W)
+    Build identity XY + initial Z phase.
 
-    phase:
-        (K,H,W,3)
-        phase_order='xyz': phase[...,0]=x, phase[...,1]=y, phase[...,2]=z
-        phase_order='zyx': phase[...,0]=z, phase[...,1]=y, phase[...,2]=x
+    Args:
+        z_init:
+            (K,), initial z coordinate in reference stack.
+        image_shape_yx:
+            (H,W)
 
-    return:
-        mapped_ref: (K,H,W)
-    """
-    ref_np = np.asarray(ref_zyx, dtype=np.float32)
-    phase_np = np.asarray(phase, dtype=np.float32)
-
-    D, Hr, Wr = ref_np.shape
-    K, H, W, C = phase_np.shape
-    assert C == 3
-    assert (H, W) == (Hr, Wr), f"XY mismatch: ref={(Hr, Wr)}, phase={(H, W)}"
-
-    if phase_order == "xyz":
-        x = phase_np[..., 0]
-        y = phase_np[..., 1]
-        z = phase_np[..., 2]
-    elif phase_order == "zyx":
-        z = phase_np[..., 0]
-        y = phase_np[..., 1]
-        x = phase_np[..., 2]
-    else:
-        raise ValueError("phase_order must be 'xyz' or 'zyx'.")
-
-    x_t = torch.from_numpy(x).to(device=device, dtype=torch.float32)
-    y_t = torch.from_numpy(y).to(device=device, dtype=torch.float32)
-    z_t = torch.from_numpy(z).to(device=device, dtype=torch.float32)
-
-    x_norm = 2.0 * x_t / max(Wr - 1, 1) - 1.0
-    y_norm = 2.0 * y_t / max(Hr - 1, 1) - 1.0
-    z_norm = 2.0 * z_t / max(D - 1, 1) - 1.0
-
-    # grid_sample 5D expects grid[..., 0:3] = x,y,z
-    grid = torch.stack([x_norm, y_norm, z_norm], dim=-1)  # (K,H,W,3)
-    grid = grid.unsqueeze(0)                              # (1,K,H,W,3)
-
-    ref_t = torch.from_numpy(ref_np).to(device=device, dtype=torch.float32)
-    ref_t = ref_t[None, None]                             # (1,1,D,H,W)
-
-    mapped = F.grid_sample(
-        ref_t,
-        grid,
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=True,
-    )
-
-    mapped_np = mapped[0, 0].detach().cpu().numpy()        # (K,H,W)
-    return mapped_np
-
-def make_init_phase_xyz(z_init, H, W):
-    """
-    return:
-        init_phase: (K,H,W,3), order xyz
+    Returns:
+        phase_xyz:
+            (K,H,W,3), phase[...,0]=x, phase[...,1]=y, phase[...,2]=z
     """
     z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
     K = len(z_init)
+    H, W = image_shape_yx
 
     yy, xx = np.meshgrid(
         np.arange(H, dtype=np.float32),
@@ -1369,355 +1327,863 @@ def make_init_phase_xyz(z_init, H, W):
 
     return phase
 
-def mse_np(a, b, mask=None):
+
+def phase_kyx_xyz_to_xyk_xyz(phase_kyx_xyz):
     """
-    a,b: (K,H,W)
+    Convert phase from inference convention to getMotion_v2 convention.
+
+    Input:
+        phase_kyx_xyz: (K,Y,X,3), xyz
+
+    Output:
+        phase_xyk_xyz: (X,Y,K,3), xyz
+    """
+    phase_kyx_xyz = np.asarray(phase_kyx_xyz, dtype=np.float32)
+    if phase_kyx_xyz.ndim != 4 or phase_kyx_xyz.shape[-1] != 3:
+        raise ValueError(
+            f"phase_kyx_xyz must be (K,Y,X,3), got {phase_kyx_xyz.shape}"
+        )
+    return phase_kyx_xyz.transpose(2, 1, 0, 3).astype(np.float32, copy=False)
+
+
+def phase_xyk_xyz_to_kyx_xyz(phase_xyk_xyz):
+    """
+    Convert phase from getMotion_v2 convention back to inference convention.
+
+    Input:
+        phase_xyk_xyz: (X,Y,K,3), xyz
+
+    Output:
+        phase_kyx_xyz: (K,Y,X,3), xyz
+    """
+    phase_xyk_xyz = np.asarray(phase_xyk_xyz, dtype=np.float32)
+    if phase_xyk_xyz.ndim != 4 or phase_xyk_xyz.shape[-1] != 3:
+        raise ValueError(
+            f"phase_xyk_xyz must be (X,Y,K,3), got {phase_xyk_xyz.shape}"
+        )
+    return phase_xyk_xyz.transpose(2, 1, 0, 3).astype(np.float32, copy=False)
+
+
+def volume_zyx_to_xyz_for_refine(vol_zyx):
+    """
+    Convert (K,Y,X) or (Z,Y,X) to (X,Y,K/Z), matching your getMotion_v2 code.
+    """
+    vol_zyx = np.asarray(vol_zyx, dtype=np.float32)
+    if vol_zyx.ndim != 3:
+        raise ValueError(f"vol_zyx must be 3D, got {vol_zyx.shape}")
+    return vol_zyx.transpose(2, 1, 0).astype(np.float32, copy=False)
+
+
+def volume_xyz_to_zyx_from_refine(vol_xyz):
+    """
+    Convert getMotion_v2 mapped result (X,Y,K) to (K,Y,X).
+    """
+    vol_xyz = np.asarray(vol_xyz, dtype=np.float32)
+    if vol_xyz.ndim != 3:
+        raise ValueError(f"vol_xyz must be 3D, got {vol_xyz.shape}")
+    return vol_xyz.transpose(2, 1, 0).astype(np.float32, copy=False)
+
+
+def sample_ref_by_phase_np(ref_zyx, phase_xyz, device=None, padding_mode="border"):
+    """
+    Sample reference stack using dense xyz phase.
+
+    Args:
+        ref_zyx:
+            (D,Y,X)
+        phase_xyz:
+            (K,Y,X,3), phase[...,0]=x, phase[...,1]=y, phase[...,2]=z
+
+    Returns:
+        mapped_zyx:
+            (K,Y,X)
+    """
+    device = get_device(device)
+
+    ref_np = np.asarray(ref_zyx, dtype=np.float32)
+    phase_np = np.asarray(phase_xyz, dtype=np.float32)
+
+    D, H, W = ref_np.shape
+    K, Hp, Wp, C = phase_np.shape
+
+    if C != 3:
+        raise ValueError(f"phase last dim must be 3, got {phase_np.shape}")
+    if (Hp, Wp) != (H, W):
+        raise ValueError(f"XY mismatch: ref={(H,W)}, phase={(Hp,Wp)}")
+
+    x = torch.from_numpy(phase_np[..., 0]).to(device=device, dtype=torch.float32)
+    y = torch.from_numpy(phase_np[..., 1]).to(device=device, dtype=torch.float32)
+    z = torch.from_numpy(phase_np[..., 2]).to(device=device, dtype=torch.float32)
+
+    x_norm = 2.0 * x / max(W - 1, 1) - 1.0
+    y_norm = 2.0 * y / max(H - 1, 1) - 1.0
+    z_norm = 2.0 * z / max(D - 1, 1) - 1.0
+
+    # grid_sample 5D expects grid order x,y,z
+    grid = torch.stack([x_norm, y_norm, z_norm], dim=-1)[None]  # (1,K,H,W,3)
+
+    ref_t = torch.from_numpy(ref_np).to(device=device, dtype=torch.float32)[None, None]
+
+    mapped = F.grid_sample(
+        ref_t,
+        grid,
+        mode="bilinear",
+        padding_mode=padding_mode,
+        align_corners=True,
+    )
+
+    return mapped[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def mse_np(a, b, mask=None, eps=1e-8):
+    """
+    Mean squared error.
+
+    Args:
+        a,b: same shape, usually (K,Y,X)
+        mask: optional boolean mask with same shape
     """
     a = np.asarray(a, dtype=np.float32)
     b = np.asarray(b, dtype=np.float32)
 
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
+
     err = (a - b) ** 2
 
-    if mask is not None:
-        mask = np.asarray(mask).astype(bool)
-        if mask.sum() == 0:
-            return np.nan
-        return float(err[mask].mean())
-
-    return float(err.mean())
-
-
-def make_init_coords_ctrl_zyx(z_init, Hc, Wc, control_stride=16):
-    """
-    Construct initial control-grid coordinates.
-
-    z_init:
-        (K,)
-
-    return:
-        coords0_ctrl_zyx: (K,Hc,Wc,3), order = z,y,x
-    """
-    z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
-    K = len(z_init)
-
-    y_ctrl = np.arange(Hc, dtype=np.float32) * float(control_stride)
-    x_ctrl = np.arange(Wc, dtype=np.float32) * float(control_stride)
-    yy, xx = np.meshgrid(y_ctrl, x_ctrl, indexing="ij")
-
-    coords0 = np.zeros((K, Hc, Wc, 3), dtype=np.float32)
-    coords0[..., 0] = z_init[:, None, None]
-    coords0[..., 1] = yy[None, :, :]
-    coords0[..., 2] = xx[None, :, :]
-
-    return coords0
-
-
-def masked_mean_np(x, mask=None, eps=1e-8):
-    x = np.asarray(x, dtype=np.float32)
-
     if mask is None:
-        return float(np.nanmean(x))
+        return float(np.mean(err))
 
     mask = np.asarray(mask).astype(bool)
-
-    if mask.shape != x.shape:
-        raise ValueError(f"mask shape {mask.shape} does not match x shape {x.shape}")
+    if mask.shape != err.shape:
+        raise ValueError(f"mask shape {mask.shape} does not match {err.shape}")
 
     if mask.sum() == 0:
         return np.nan
 
-    return float(np.nanmean(x[mask]))
+    return float(err[mask].mean())
 
 
-def compute_coord_metrics_ctrl(
-    pred_coords_ctrl_zyx,
-    gt_coords_ctrl_zyx,
-    z_init,
-    valid_mask_ctrl=None,
-    control_stride=16,
-):
+def phase_l2_error_xyz(pred_phase_xyz, gt_phase_xyz, mask=None):
     """
-    Compare predicted control-grid coordinates with GT coordinates.
+    Dense phase coordinate L2 error.
 
-    pred_coords_ctrl_zyx:
-        (K,Hc,Wc,3), order z,y,x
+    Args:
+        pred_phase_xyz, gt_phase_xyz:
+            (K,Y,X,3), xyz
 
-    gt_coords_ctrl_zyx:
-        (K,Hc,Wc,3), order z,y,x
-
-    valid_mask_ctrl:
-        optional, (K,Hc,Wc)
-
-    return:
-        dict of coordinate metrics.
+    Returns:
+        mean 3D L2 coordinate error.
     """
-    pred = np.asarray(pred_coords_ctrl_zyx, dtype=np.float32)
-    gt = np.asarray(gt_coords_ctrl_zyx, dtype=np.float32)
+    pred = np.asarray(pred_phase_xyz, dtype=np.float32)
+    gt = np.asarray(gt_phase_xyz, dtype=np.float32)
 
     if pred.shape != gt.shape:
-        raise ValueError(f"pred shape {pred.shape} != gt shape {gt.shape}")
+        raise ValueError(f"phase shape mismatch: pred={pred.shape}, gt={gt.shape}")
 
-    K, Hc, Wc, _ = pred.shape
+    err = np.linalg.norm(pred - gt, axis=-1)
 
-    init = make_init_coords_ctrl_zyx(
-        z_init=z_init,
-        Hc=Hc,
-        Wc=Wc,
-        control_stride=control_stride,
-    )
+    if mask is None:
+        return float(np.mean(err))
 
-    if valid_mask_ctrl is not None:
-        valid = np.asarray(valid_mask_ctrl).astype(bool)
-        if valid.shape != (K, Hc, Wc):
-            raise ValueError(
-                f"valid_mask_ctrl shape {valid.shape} != expected {(K,Hc,Wc)}"
-            )
-    else:
-        valid = None
+    mask = np.asarray(mask).astype(bool)
+    if mask.shape != err.shape:
+        raise ValueError(f"mask shape {mask.shape} does not match {err.shape}")
 
-    err_pred = pred - gt
-    err_init = init - gt
+    if mask.sum() == 0:
+        return np.nan
 
-    # L1 in z,y,x
-    l1_pred = np.abs(err_pred).sum(axis=-1)
-    l1_init = np.abs(err_init).sum(axis=-1)
-
-    # L2 in z,y,x
-    l2_pred = np.linalg.norm(err_pred, axis=-1)
-    l2_init = np.linalg.norm(err_init, axis=-1)
-
-    # z error
-    z_abs_pred = np.abs(err_pred[..., 0])
-    z_abs_init = np.abs(err_init[..., 0])
-
-    # xy error
-    xy_l2_pred = np.linalg.norm(err_pred[..., 1:3], axis=-1)
-    xy_l2_init = np.linalg.norm(err_init[..., 1:3], axis=-1)
-
-    coord_l1_pred = masked_mean_np(l1_pred, valid)
-    coord_l1_init = masked_mean_np(l1_init, valid)
-
-    coord_l2_pred = masked_mean_np(l2_pred, valid)
-    coord_l2_init = masked_mean_np(l2_init, valid)
-
-    z_abs_pred_mean = masked_mean_np(z_abs_pred, valid)
-    z_abs_init_mean = masked_mean_np(z_abs_init, valid)
-
-    xy_l2_pred_mean = masked_mean_np(xy_l2_pred, valid)
-    xy_l2_init_mean = masked_mean_np(xy_l2_init, valid)
-
-    return {
-        # absolute error
-        "coord_l1_init": coord_l1_init,
-        "coord_l1_pred": coord_l1_pred,
-        "coord_l2_init": coord_l2_init,
-        "coord_l2_pred": coord_l2_pred,
-        "z_abs_init": z_abs_init_mean,
-        "z_abs_pred": z_abs_pred_mean,
-        "xy_l2_init": xy_l2_init_mean,
-        "xy_l2_pred": xy_l2_pred_mean,
-
-        # improvement: positive means prediction is better than init
-        "coord_l1_improvement": coord_l1_init - coord_l1_pred,
-        "coord_l2_improvement": coord_l2_init - coord_l2_pred,
-        "z_abs_improvement": z_abs_init_mean - z_abs_pred_mean,
-        "xy_l2_improvement": xy_l2_init_mean - xy_l2_pred_mean,
-
-        # relative improvement
-        "coord_l1_relative_improvement": (
-            coord_l1_init - coord_l1_pred
-        ) / (coord_l1_init + 1e-8),
-        "coord_l2_relative_improvement": (
-            coord_l2_init - coord_l2_pred
-        ) / (coord_l2_init + 1e-8),
-        "xy_l2_relative_improvement": (
-            xy_l2_init_mean - xy_l2_pred_mean
-        ) / (xy_l2_init_mean + 1e-8),
-    }
-
-def extract_gt_coords_from_batch_item(
-    batch,
-    b,
-    z_init,
-    pred_coords_ctrl_zyx,
-    control_stride=16,
-):
-    """
-    Return:
-        gt_coords_ctrl_zyx or None
-        valid_mask_ctrl or None
-    """
-    K, Hc, Wc, _ = pred_coords_ctrl_zyx.shape
-
-    gt_coords = None
-
-    if "gt_coords" in batch:
-        gt_coords = batch["gt_coords"][b].detach().cpu().numpy().astype(np.float32)
-
-    elif "gt_coords_ctrl" in batch:
-        gt_coords = batch["gt_coords_ctrl"][b].detach().cpu().numpy().astype(np.float32)
-
-    elif "gt_disp" in batch:
-        gt_disp = batch["gt_disp"][b].detach().cpu().numpy().astype(np.float32)
-
-        coords0 = make_init_coords_ctrl_zyx(
-            z_init=z_init,
-            Hc=Hc,
-            Wc=Wc,
-            control_stride=control_stride,
-        )
-
-        gt_coords = coords0 + gt_disp
-
-    else:
-        gt_coords = None
-
-    valid_mask = None
-
-    if "valid_mask" in batch:
-        valid_mask = batch["valid_mask"][b].detach().cpu().numpy().astype(bool)
-
-    elif "valid" in batch:
-        valid_mask = batch["valid"][b].detach().cpu().numpy().astype(bool)
-
-    return gt_coords, valid_mask
+    return float(err[mask].mean())
 
 
-def evaluate_one_sample_with_predictor(
-    predictor,
+def estimate_initial_z_fixed_spacing(
     mov_zyx,
     ref_zyx,
-    z_init,
-    ref_spacing=(1.0, 1.0, 1.0),
-    normalize=True,
-    phase_order="xyz",
-    use_patchwise=False,
-    patchwise_kwargs=None,
-
-    # new
-    gt_coords_ctrl_zyx=None,
-    valid_mask_ctrl=None,
+    delta_ref_idx,
+    calflow_module,
+    use_gradient=False,
+    use_hann_weight=True,
+    direction=1,
 ):
     """
-    mov_zyx: (K,H,W)
-    ref_zyx: (D,H,W)
-    z_init:  (K,)
+    Estimate global fixed-spacing z initialization.
 
-    gt_coords_ctrl_zyx:
-        optional, (K,Hc,Wc,3), order z,y,x
+    Inputs:
+        mov_zyx: (K,Y,X)
+        ref_zyx: (D,Y,X)
 
-    valid_mask_ctrl:
-        optional, (K,Hc,Wc)
-
-    return:
-        dict with image-level MSE metrics and coordinate metrics.
+    The calFlowCrossResolution function expects:
+        mov: (X,Y,K)
+        ref: (X,Y,D)
     """
-    mov_zyx = np.asarray(mov_zyx, dtype=np.float32)
+    mov_xyz = volume_zyx_to_xyz_for_refine(mov_zyx)
+    ref_xyz = volume_zyx_to_xyz_for_refine(ref_zyx)
+
+    z_init = calflow_module.FindInitZ_stack_global_fixed_spacing(
+        mov_xyz,
+        ref_xyz,
+        delta_ref_idx=delta_ref_idx,
+        use_gradient=use_gradient,
+        use_hann_weight=use_hann_weight,
+        direction=direction,
+    )
+
+    return np.asarray(z_init, dtype=np.float32).reshape(-1)
+
+
+def maybe_apply_ref_intensity_mapping_for_refine(
+    ref_zyx,
+    mov_zyx,
+    z_init,
+    prep_module=None,
+    percentiles=None,
+):
+    """
+    Optional ref -> moving quantile mapping.
+
+    Returns:
+        ref_eval_zyx:
+            Reference after optional intensity mapping.
+
+        mapping_info:
+            dict containing quantile information or None.
+
+    Notes:
+        If prep_module is None, this function returns original ref_zyx.
+    """
     ref_zyx = np.asarray(ref_zyx, dtype=np.float32)
+    mov_zyx = np.asarray(mov_zyx, dtype=np.float32)
     z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
 
-    K, H, W = mov_zyx.shape
+    if prep_module is None:
+        return ref_zyx.astype(np.float32, copy=False), None
 
-    if normalize:
-        mov_eval = percentile_normalize_01_np(mov_zyx)
-        ref_eval = percentile_normalize_01_np(ref_zyx)
-    else:
-        mov_eval = mov_zyx
-        ref_eval = ref_zyx
+    if percentiles is None:
+        percentiles = [
+            0.1, 0.5, 1, 2, 5,
+            10, 25, 50, 75, 90,
+            95, 99, 99.5, 99.8,
+        ]
 
-    if use_patchwise:
-        if patchwise_kwargs is None:
-            patchwise_kwargs = {}
+    z_idx = np.rint(z_init).astype(np.int32)
+    z_idx = np.clip(z_idx, 0, ref_zyx.shape[0] - 1)
 
-        pred_phase = predictor.predict_patchwise(
-            mov=mov_eval,
-            ref=ref_eval,
-            z_init=z_init,
-            ref_spacing=ref_spacing,
-            mov_order="zyx",
-            ref_order="zyx",
-            normalize=False,
-            phase_order=phase_order,
-            verbose=False,
-            **patchwise_kwargs,
-        )
+    ref_source_zyx = ref_zyx[z_idx]  # (K,Y,X)
 
-        # patchwise 当前只返回 dense phase，不返回 control-grid pred_coords
-        pred_coords_ctrl_zyx = None
-
-    else:
-        pred_out = predictor.predict_full(
-            mov=mov_eval,
-            ref=ref_eval,
-            z_init=z_init,
-            ref_spacing=ref_spacing,
-            mov_order="zyx",
-            ref_order="zyx",
-            normalize=False,
-            phase_order=phase_order,
-            return_dict=True,
-        )
-
-        pred_phase = pred_out["phase"]
-        pred_coords_ctrl_zyx = pred_out.get("pred_coords_ctrl_zyx", None)
-
-    init_phase = make_init_phase_xyz(z_init=z_init, H=H, W=W)
-
-    mapped_init = sample_ref_by_phase_np(
-        ref_eval,
-        init_phase,
-        phase_order="xyz",
-        device=str(predictor.device),
+    src_q, tgt_q, used_percentiles = prep_module.learn_quantile_mapping(
+        source=ref_source_zyx,
+        target=mov_zyx,
+        percentiles=percentiles,
     )
 
-    mapped_pred = sample_ref_by_phase_np(
-        ref_eval,
-        pred_phase,
-        phase_order=phase_order,
-        device=str(predictor.device),
-    )
+    ref_adj_zyx = prep_module.apply_quantile_mapping(
+        ref_zyx,
+        src_q,
+        tgt_q,
+    ).astype(np.float32, copy=False)
 
-    mse_init = mse_np(mapped_init, mov_eval)
-    mse_pred = mse_np(mapped_pred, mov_eval)
-
-    delta_mse = mse_init - mse_pred
-
-    # 推荐主要看这个比例
-    relative_mse_improvement = delta_mse / (mse_init + 1e-8)
-
-    result = {
-        "mse_init": mse_init,
-        "mse_pred": mse_pred,
-        "delta_mse": delta_mse,
-
-        # new: positive means improved
-        "relative_mse_improvement": relative_mse_improvement,
-
-        # optional: lower is better
-        "mse_ratio_pred_over_init": mse_pred / (mse_init + 1e-8),
-
-        "pred_phase": pred_phase,
-        "init_phase": init_phase,
-        "mapped_init": mapped_init,
-        "mapped_pred": mapped_pred,
-        "mov_eval": mov_eval,
-        "ref_eval": ref_eval,
+    mapping_info = {
+        "src_q": src_q,
+        "tgt_q": tgt_q,
+        "used_percentiles": used_percentiles,
+        "z_idx": z_idx,
     }
 
-    # ----------------------------------------------------
-    # Coordinate metrics
-    # ----------------------------------------------------
-    if (gt_coords_ctrl_zyx is not None) and (pred_coords_ctrl_zyx is not None):
-        control_stride = int(predictor.model_config.get("control_stride", 16))
+    return ref_adj_zyx, mapping_info
 
-        coord_metrics = compute_coord_metrics_ctrl(
-            pred_coords_ctrl_zyx=pred_coords_ctrl_zyx,
-            gt_coords_ctrl_zyx=gt_coords_ctrl_zyx,
+
+def build_refine_option(
+    option_template,
+    init_phase_xyz,
+    mov_eval_zyx,
+    ref_eval_zyx,
+    mask_module=None,
+    prep_module=None,
+    thresFactor=5.0,
+    maskRange=(5.0, 4000.0),
+    smoothPenalty_raw=0.01,
+    extra_option_updates=None,
+):
+    """
+    Build option dict for getMotion_v2.
+
+    option['phase'] must be (X,Y,K,3), xyz.
+    """
+    if option_template is None:
+        option = {}
+    else:
+        option = copy.deepcopy(option_template)
+
+    # Basic defaults. User can override via option_template or extra_option_updates.
+    option.setdefault("r", 5)
+    option.setdefault("layer", 3)
+    option.setdefault("iter", 10)
+    option.setdefault("movRange", 5.0)
+    option.setdefault("tol", 1e-6)
+    option.setdefault("zRatio_HR", 1)
+    option.setdefault("wrong_region_enable", False)
+
+    option["phase"] = phase_kyx_xyz_to_xyk_xyz(init_phase_xyz)
+
+    mov_xyz = volume_zyx_to_xyz_for_refine(mov_eval_zyx)
+    ref_xyz = volume_zyx_to_xyz_for_refine(ref_eval_zyx)
+
+    if mask_module is not None:
+        option["mask_mov"] = mask_module.getMask(mov_xyz, thresFactor)
+        option["mask_mov"] = mask_module.bwareafilt3_wei(option["mask_mov"], maskRange)
+
+        option["mask_ref"] = mask_module.getMask(ref_xyz, thresFactor)
+        option["mask_ref"] = mask_module.bwareafilt3_wei(option["mask_ref"], maskRange)
+
+    if prep_module is not None:
+        try:
+            pnl_factor = prep_module.getSmPnltNormFctr(ref_xyz, option)
+            option["smoothPenalty"] = pnl_factor * smoothPenalty_raw
+        except Exception:
+            # Keep user-provided smoothPenalty if normalization helper fails.
+            option.setdefault("smoothPenalty", smoothPenalty_raw)
+    else:
+        option.setdefault("smoothPenalty", smoothPenalty_raw)
+
+    if extra_option_updates is not None:
+        option.update(extra_option_updates)
+
+    return option
+
+
+def run_getmotion_refine_from_phase(
+    mov_eval_zyx,
+    ref_eval_zyx,
+    init_phase_xyz,
+    calflow_module,
+    option_template=None,
+    mask_module=None,
+    prep_module=None,
+    thresFactor=5.0,
+    maskRange=(5.0, 4000.0),
+    smoothPenalty_raw=0.01,
+    extra_option_updates=None,
+    verbose=False,
+):
+    """
+    Run getMotion_v2 from a given dense phase.
+
+    Args:
+        mov_eval_zyx:
+            (K,Y,X)
+        ref_eval_zyx:
+            (D,Y,X)
+        init_phase_xyz:
+            (K,Y,X,3), xyz
+
+    Returns:
+        dict with:
+            phase_xyz:
+                final refined phase, (K,Y,X,3)
+            mapped_zyx:
+                mapped reference image after refinement, (K,Y,X)
+            motion_current:
+                raw motion output from getMotion_v2
+            option:
+                option used by getMotion_v2
+    """
+    mov_xyz = volume_zyx_to_xyz_for_refine(mov_eval_zyx)
+    ref_xyz = volume_zyx_to_xyz_for_refine(ref_eval_zyx)
+
+    option = build_refine_option(
+        option_template=option_template,
+        init_phase_xyz=init_phase_xyz,
+        mov_eval_zyx=mov_eval_zyx,
+        ref_eval_zyx=ref_eval_zyx,
+        mask_module=mask_module,
+        prep_module=prep_module,
+        thresFactor=thresFactor,
+        maskRange=maskRange,
+        smoothPenalty_raw=smoothPenalty_raw,
+        extra_option_updates=extra_option_updates,
+    )
+
+    phase_new_xyk_xyz, motion_current, mapped_xyz = calflow_module.getMotion_v2(
+        mov_xyz,
+        ref_xyz,
+        option,
+        verbose=verbose,
+    )
+
+    phase_new_kyx_xyz = phase_xyk_xyz_to_kyx_xyz(phase_new_xyk_xyz)
+    mapped_zyx = volume_xyz_to_zyx_from_refine(mapped_xyz)
+
+    return {
+        "phase_xyz": phase_new_kyx_xyz,
+        "mapped_zyx": mapped_zyx,
+        "motion_current": motion_current,
+        "option": option,
+    }
+
+
+def evaluate_coarse_and_refine_simulated_pair(
+    mov,
+    ref,
+    pth_path,
+    delta_ref_idx,
+    calflow_module,
+    model_config=None,
+    model_module="CoarseFlow.models.SparseGMFlow3D",
+    model_class="CoarseMatchingNet",
+    device=None,
+    ref_spacing=(1.0, 1.0, 1.0),
+    mov_order="zyx",
+    ref_order="zyx",
+    normalize=True,
+    use_quantile_mapping=False,
+    prep_module=None,
+    mask_module=None,
+    option_template=None,
+    thresFactor=5.0,
+    maskRange=(5.0, 4000.0),
+    smoothPenalty_raw=0.01,
+    percentiles=None,
+    extra_option_updates=None,
+    z_init=None,
+    use_gradient_for_z_init=False,
+    use_hann_weight_for_z_init=True,
+    z_direction=1,
+    gt_phase_xyz=None,
+    strict_load=True,
+    use_amp=False,
+    verbose=False,
+):
+    """
+    High-level evaluation for one simulated pair.
+
+    It computes:
+        1. init result
+        2. coarse result
+        3. refine from init
+        4. refine from coarse
+
+    Args:
+        mov:
+            moving sparse stack. Default mov_order='zyx': (K,Y,X)
+        ref:
+            reference dense stack. Default ref_order='zyx': (D,Y,X)
+        pth_path:
+            CoarseFlow checkpoint.
+            If model_config=None, this function tries ckpt['model_config'].
+        delta_ref_idx:
+            fixed z spacing between moving slices in reference-index units.
+            This is needed by FindInitZ_stack_global_fixed_spacing.
+        calflow_module:
+            your calFlowCrossResolution module.
+        prep_module:
+            optional prep module for quantile mapping / smooth penalty normalization.
+        mask_module:
+            optional mask module for getMotion_v2 masks.
+        gt_phase_xyz:
+            optional dense GT phase, (K,Y,X,3), xyz, for coordinate error.
+
+    Returns:
+        dict containing phases, mapped images, and metrics.
+    """
+    device = get_device(device)
+
+    mov_zyx_raw = convert_volume_to_zyx(mov, order=mov_order, name="mov")
+    ref_zyx_raw = convert_volume_to_zyx(ref, order=ref_order, name="ref")
+
+    K, H, W = mov_zyx_raw.shape
+    D, Hr, Wr = ref_zyx_raw.shape
+
+    if (Hr, Wr) != (H, W):
+        raise ValueError(f"XY mismatch: mov={mov_zyx_raw.shape}, ref={ref_zyx_raw.shape}")
+
+    # ------------------------------------------------------------
+    # 1. Estimate initial z if not provided
+    # ------------------------------------------------------------
+    if z_init is None:
+        z_init = estimate_initial_z_fixed_spacing(
+            mov_zyx=mov_zyx_raw,
+            ref_zyx=ref_zyx_raw,
+            delta_ref_idx=delta_ref_idx,
+            calflow_module=calflow_module,
+            use_gradient=use_gradient_for_z_init,
+            use_hann_weight=use_hann_weight_for_z_init,
+            direction=z_direction,
+        )
+    else:
+        z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
+
+    if len(z_init) != K:
+        raise ValueError(f"z_init length {len(z_init)} != K={K}")
+
+    # ------------------------------------------------------------
+    # 2. Normalize / intensity-adjust reference
+    # ------------------------------------------------------------
+    if normalize:
+        mov_eval_zyx = percentile_normalize_01_np(mov_zyx_raw)
+        ref_norm_zyx = percentile_normalize_01_np(ref_zyx_raw)
+    else:
+        mov_eval_zyx = mov_zyx_raw.astype(np.float32, copy=False)
+        ref_norm_zyx = ref_zyx_raw.astype(np.float32, copy=False)
+
+    if use_quantile_mapping:
+        ref_eval_zyx, mapping_info = maybe_apply_ref_intensity_mapping_for_refine(
+            ref_zyx=ref_norm_zyx,
+            mov_zyx=mov_eval_zyx,
             z_init=z_init,
-            valid_mask_ctrl=valid_mask_ctrl,
-            control_stride=control_stride,
+            prep_module=prep_module,
+            percentiles=percentiles,
+        )
+    else:
+        ref_eval_zyx = ref_norm_zyx
+        mapping_info = None
+
+    # ------------------------------------------------------------
+    # 3. Build init phase
+    # ------------------------------------------------------------
+    init_phase_xyz = make_init_phase_xyz_from_z_init(
+        z_init=z_init,
+        image_shape_yx=(H, W),
+    )
+
+    # ------------------------------------------------------------
+    # 4. CoarseFlow prediction
+    # ------------------------------------------------------------
+    cfg = CoarseFlowInferenceConfig(
+        pth_path=pth_path,
+        model_config=model_config,
+        model_module=model_module,
+        model_class=model_class,
+        device=device,
+        strict_load=strict_load,
+        use_amp=use_amp,
+    )
+
+    predictor = CoarseFlowPredictor(cfg)
+
+    coarse_out = predictor.predict_full(
+        mov=mov_eval_zyx,
+        ref=ref_eval_zyx,
+        z_init=z_init,
+        ref_spacing=ref_spacing,
+        mov_order="zyx",
+        ref_order="zyx",
+        normalize=False,
+        phase_order="xyz",
+        return_dict=True,
+    )
+
+    coarse_phase_xyz = coarse_out["phase"]
+
+    # ------------------------------------------------------------
+    # 5. Image MSE before refine
+    # ------------------------------------------------------------
+    mapped_init_zyx = sample_ref_by_phase_np(
+        ref_eval_zyx,
+        init_phase_xyz,
+        device=device,
+    )
+
+    mapped_coarse_zyx = sample_ref_by_phase_np(
+        ref_eval_zyx,
+        coarse_phase_xyz,
+        device=device,
+    )
+
+    mse_init = mse_np(mapped_init_zyx, mov_eval_zyx)
+    mse_coarse = mse_np(mapped_coarse_zyx, mov_eval_zyx)
+
+    # ------------------------------------------------------------
+    # 6. Refine from init and refine from coarse
+    # ------------------------------------------------------------
+    refine_init = run_getmotion_refine_from_phase(
+        mov_eval_zyx=mov_eval_zyx,
+        ref_eval_zyx=ref_eval_zyx,
+        init_phase_xyz=init_phase_xyz,
+        calflow_module=calflow_module,
+        option_template=option_template,
+        mask_module=mask_module,
+        prep_module=prep_module,
+        thresFactor=thresFactor,
+        maskRange=maskRange,
+        smoothPenalty_raw=smoothPenalty_raw,
+        extra_option_updates=extra_option_updates,
+        verbose=verbose,
+    )
+
+    refine_coarse = run_getmotion_refine_from_phase(
+        mov_eval_zyx=mov_eval_zyx,
+        ref_eval_zyx=ref_eval_zyx,
+        init_phase_xyz=coarse_phase_xyz,
+        calflow_module=calflow_module,
+        option_template=option_template,
+        mask_module=mask_module,
+        prep_module=prep_module,
+        thresFactor=thresFactor,
+        maskRange=maskRange,
+        smoothPenalty_raw=smoothPenalty_raw,
+        extra_option_updates=extra_option_updates,
+        verbose=verbose,
+    )
+
+    mse_refine_init = mse_np(refine_init["mapped_zyx"], mov_eval_zyx)
+    mse_refine_coarse = mse_np(refine_coarse["mapped_zyx"], mov_eval_zyx)
+
+    # ------------------------------------------------------------
+    # 7. Metrics
+    # ------------------------------------------------------------
+    metrics = {
+        # four raw MSE values
+        "mse_init": mse_init,
+        "mse_coarse": mse_coarse,
+        "mse_refine_init": mse_refine_init,
+        "mse_refine_coarse": mse_refine_coarse,
+
+        # coarse effect
+        "rel_coarse_imp": (mse_init - mse_coarse) / (mse_init + 1e-8),
+        "coarse_mse_ratio": mse_coarse / (mse_init + 1e-8),
+
+        # final effect: the most important one for your question
+        "rel_final_imp": (mse_refine_init - mse_refine_coarse) / (mse_refine_init + 1e-8),
+        "final_mse_ratio": mse_refine_coarse / (mse_refine_init + 1e-8),
+
+        # how much each refine improves its own initialization
+        "refine_gain_after_init": (mse_init - mse_refine_init) / (mse_init + 1e-8),
+        "refine_gain_after_coarse": (mse_coarse - mse_refine_coarse) / (mse_coarse + 1e-8),
+    }
+
+    if gt_phase_xyz is not None:
+        gt_phase_xyz = np.asarray(gt_phase_xyz, dtype=np.float32)
+
+        metrics.update(
+            {
+                "coord_l2_init": phase_l2_error_xyz(init_phase_xyz, gt_phase_xyz),
+                "coord_l2_coarse": phase_l2_error_xyz(coarse_phase_xyz, gt_phase_xyz),
+                "coord_l2_refine_init": phase_l2_error_xyz(
+                    refine_init["phase_xyz"], gt_phase_xyz
+                ),
+                "coord_l2_refine_coarse": phase_l2_error_xyz(
+                    refine_coarse["phase_xyz"], gt_phase_xyz
+                ),
+            }
         )
 
-        result.update(coord_metrics)
+        metrics["coord_l2_coarse_imp"] = (
+            metrics["coord_l2_init"] - metrics["coord_l2_coarse"]
+        )
+        metrics["coord_l2_final_imp"] = (
+            metrics["coord_l2_refine_init"] - metrics["coord_l2_refine_coarse"]
+        )
+
+    result = {
+        "metrics": metrics,
+        "z_init": z_init,
+        "mapping_info": mapping_info,
+        "model_config": predictor.model_config,
+        "coarse_out": coarse_out,
+
+        "mov_eval_zyx": mov_eval_zyx,
+        "ref_eval_zyx": ref_eval_zyx,
+
+        "init_phase_xyz": init_phase_xyz,
+        "coarse_phase_xyz": coarse_phase_xyz,
+        "refine_init_phase_xyz": refine_init["phase_xyz"],
+        "refine_coarse_phase_xyz": refine_coarse["phase_xyz"],
+
+        "mapped_init_zyx": mapped_init_zyx,
+        "mapped_coarse_zyx": mapped_coarse_zyx,
+        "mapped_refine_init_zyx": refine_init["mapped_zyx"],
+        "mapped_refine_coarse_zyx": refine_coarse["mapped_zyx"],
+
+        "refine_init": refine_init,
+        "refine_coarse": refine_coarse,
+    }
 
     return result
+
+
+def evaluate_coarse_and_refine_simulated_pair_with_predictor(
+    predictor,
+    mov,
+    ref,
+    delta_ref_idx,
+    calflow_module,
+    ref_spacing=(1.0, 1.0, 1.0),
+    mov_order="zyx",
+    ref_order="zyx",
+    normalize=True,
+    use_quantile_mapping=False,
+    prep_module=None,
+    mask_module=None,
+    option_template=None,
+    thresFactor=5.0,
+    maskRange=(5.0, 4000.0),
+    smoothPenalty_raw=0.01,
+    percentiles=None,
+    extra_option_updates=None,
+    z_init=None,
+    use_gradient_for_z_init=False,
+    use_hann_weight_for_z_init=True,
+    z_direction=1,
+    gt_phase_xyz=None,
+    verbose=False,
+):
+    """
+    Same as evaluate_coarse_and_refine_simulated_pair, but reuses a preloaded predictor.
+    This is recommended for dataset-level evaluation.
+    """
+    device = predictor.device
+
+    mov_zyx_raw = convert_volume_to_zyx(mov, order=mov_order, name="mov")
+    ref_zyx_raw = convert_volume_to_zyx(ref, order=ref_order, name="ref")
+
+    K, H, W = mov_zyx_raw.shape
+    D, Hr, Wr = ref_zyx_raw.shape
+
+    if (Hr, Wr) != (H, W):
+        raise ValueError(f"XY mismatch: mov={mov_zyx_raw.shape}, ref={ref_zyx_raw.shape}")
+
+    if z_init is None:
+        z_init = estimate_initial_z_fixed_spacing(
+            mov_zyx=mov_zyx_raw,
+            ref_zyx=ref_zyx_raw,
+            delta_ref_idx=delta_ref_idx,
+            calflow_module=calflow_module,
+            use_gradient=use_gradient_for_z_init,
+            use_hann_weight=use_hann_weight_for_z_init,
+            direction=z_direction,
+        )
+    else:
+        z_init = np.asarray(z_init, dtype=np.float32).reshape(-1)
+
+    if normalize:
+        mov_eval_zyx = percentile_normalize_01_np(mov_zyx_raw)
+        ref_norm_zyx = percentile_normalize_01_np(ref_zyx_raw)
+    else:
+        mov_eval_zyx = mov_zyx_raw.astype(np.float32, copy=False)
+        ref_norm_zyx = ref_zyx_raw.astype(np.float32, copy=False)
+
+    if use_quantile_mapping:
+        ref_eval_zyx, mapping_info = maybe_apply_ref_intensity_mapping_for_refine(
+            ref_zyx=ref_norm_zyx,
+            mov_zyx=mov_eval_zyx,
+            z_init=z_init,
+            prep_module=prep_module,
+            percentiles=percentiles,
+        )
+    else:
+        ref_eval_zyx = ref_norm_zyx
+        mapping_info = None
+
+    init_phase_xyz = make_init_phase_xyz_from_z_init(
+        z_init=z_init,
+        image_shape_yx=(H, W),
+    )
+
+    coarse_out = predictor.predict_full(
+        mov=mov_eval_zyx,
+        ref=ref_eval_zyx,
+        z_init=z_init,
+        ref_spacing=ref_spacing,
+        mov_order="zyx",
+        ref_order="zyx",
+        normalize=False,
+        phase_order="xyz",
+        return_dict=True,
+    )
+
+    coarse_phase_xyz = coarse_out["phase"]
+
+    mapped_init_zyx = sample_ref_by_phase_np(ref_eval_zyx, init_phase_xyz, device=device)
+    mapped_coarse_zyx = sample_ref_by_phase_np(ref_eval_zyx, coarse_phase_xyz, device=device)
+
+    mse_init = mse_np(mapped_init_zyx, mov_eval_zyx)
+    mse_coarse = mse_np(mapped_coarse_zyx, mov_eval_zyx)
+
+    refine_init = run_getmotion_refine_from_phase(
+        mov_eval_zyx=mov_eval_zyx,
+        ref_eval_zyx=ref_eval_zyx,
+        init_phase_xyz=init_phase_xyz,
+        calflow_module=calflow_module,
+        option_template=option_template,
+        mask_module=mask_module,
+        prep_module=prep_module,
+        thresFactor=thresFactor,
+        maskRange=maskRange,
+        smoothPenalty_raw=smoothPenalty_raw,
+        extra_option_updates=extra_option_updates,
+        verbose=verbose,
+    )
+
+    refine_coarse = run_getmotion_refine_from_phase(
+        mov_eval_zyx=mov_eval_zyx,
+        ref_eval_zyx=ref_eval_zyx,
+        init_phase_xyz=coarse_phase_xyz,
+        calflow_module=calflow_module,
+        option_template=option_template,
+        mask_module=mask_module,
+        prep_module=prep_module,
+        thresFactor=thresFactor,
+        maskRange=maskRange,
+        smoothPenalty_raw=smoothPenalty_raw,
+        extra_option_updates=extra_option_updates,
+        verbose=verbose,
+    )
+
+    mse_refine_init = mse_np(refine_init["mapped_zyx"], mov_eval_zyx)
+    mse_refine_coarse = mse_np(refine_coarse["mapped_zyx"], mov_eval_zyx)
+
+    metrics = {
+        "mse_init": mse_init,
+        "mse_coarse": mse_coarse,
+        "mse_refine_init": mse_refine_init,
+        "mse_refine_coarse": mse_refine_coarse,
+
+        "rel_coarse_imp": (mse_init - mse_coarse) / (mse_init + 1e-8),
+        "coarse_mse_ratio": mse_coarse / (mse_init + 1e-8),
+
+        "rel_final_imp": (mse_refine_init - mse_refine_coarse) / (mse_refine_init + 1e-8),
+        "final_mse_ratio": mse_refine_coarse / (mse_refine_init + 1e-8),
+
+        "refine_gain_after_init": (mse_init - mse_refine_init) / (mse_init + 1e-8),
+        "refine_gain_after_coarse": (mse_coarse - mse_refine_coarse) / (mse_coarse + 1e-8),
+    }
+
+    if gt_phase_xyz is not None:
+        gt_phase_xyz = np.asarray(gt_phase_xyz, dtype=np.float32)
+
+        metrics.update(
+            {
+                "coord_l2_init": phase_l2_error_xyz(init_phase_xyz, gt_phase_xyz),
+                "coord_l2_coarse": phase_l2_error_xyz(coarse_phase_xyz, gt_phase_xyz),
+                "coord_l2_refine_init": phase_l2_error_xyz(refine_init["phase_xyz"], gt_phase_xyz),
+                "coord_l2_refine_coarse": phase_l2_error_xyz(refine_coarse["phase_xyz"], gt_phase_xyz),
+            }
+        )
+
+        metrics["coord_l2_coarse_imp"] = metrics["coord_l2_init"] - metrics["coord_l2_coarse"]
+        metrics["coord_l2_final_imp"] = (
+            metrics["coord_l2_refine_init"] - metrics["coord_l2_refine_coarse"]
+        )
+
+    return {
+        "metrics": metrics,
+        "z_init": z_init,
+        "mapping_info": mapping_info,
+        "coarse_out": coarse_out,
+
+        "mov_eval_zyx": mov_eval_zyx,
+        "ref_eval_zyx": ref_eval_zyx,
+
+        "init_phase_xyz": init_phase_xyz,
+        "coarse_phase_xyz": coarse_phase_xyz,
+        "refine_init_phase_xyz": refine_init["phase_xyz"],
+        "refine_coarse_phase_xyz": refine_coarse["phase_xyz"],
+
+        "mapped_init_zyx": mapped_init_zyx,
+        "mapped_coarse_zyx": mapped_coarse_zyx,
+        "mapped_refine_init_zyx": refine_init["mapped_zyx"],
+        "mapped_refine_coarse_zyx": refine_coarse["mapped_zyx"],
+
+        "refine_init": refine_init,
+        "refine_coarse": refine_coarse,
+    }
