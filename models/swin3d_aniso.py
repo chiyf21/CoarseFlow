@@ -610,7 +610,8 @@ class BasicLayer3D(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x):
+    def forward_blocks(self, x):
+        """Run only the transformer blocks, return pre-downsample features."""
         for blk in self.blocks:
             if self.use_checkpoint:
                 try:
@@ -619,12 +620,82 @@ class BasicLayer3D(nn.Module):
                     x = checkpoint.checkpoint(blk, x)
             else:
                 x = blk(x)
+        return x
+
+    def forward(self, x):
+        x = self.forward_blocks(x)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, depth={self.depth}"
+
+
+# ============================================================
+# FeatureFusion3D
+# ============================================================
+
+class FeatureFusion3D(nn.Module):
+    """Multi-scale feature fusion for 3D anisotropic encoder.
+
+    Fuses features from 1/2, 1/4, and 1/8 XY resolutions.
+    Projects each to a unified fuse_dim, aligns XY with pooling,
+    then concats and projects to out_dim.
+
+    All fusion operations are XY-only; Z dimension is untouched.
+    """
+
+    def __init__(self, dims=(24, 48, 96), fuse_dim=32, out_dim=96):
+        super().__init__()
+        self.fuse_dim = fuse_dim
+        self.out_dim = out_dim
+
+        # 1x1x1 Conv3d projections for each scale
+        self.proj_s1 = nn.Conv3d(dims[0], fuse_dim, kernel_size=1)
+        self.proj_s2 = nn.Conv3d(dims[1], fuse_dim, kernel_size=1)
+        self.proj_s3 = nn.Conv3d(dims[2], fuse_dim, kernel_size=1)
+
+        # Final mix after concat
+        self.proj_out = nn.Conv3d(fuse_dim * 3, out_dim, kernel_size=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in [self.proj_s1, self.proj_s2, self.proj_s3, self.proj_out]:
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, feat_s1, feat_s2, feat_final):
+        """
+        Args:
+            feat_s1:   (B, dims[0], Z, H/2, W/2)  channel-first
+            feat_s2:   (B, dims[1], Z, H/4, W/4)  channel-first
+            feat_final:(B, dims[2], Z, H/8, W/8)  channel-first
+
+        Returns:
+            (B, out_dim, Z, H/8, W/8)  channel-first
+        """
+        # Target spatial size
+        _, _, Z, Hf, Wf = feat_final.shape
+
+        # Project each scale
+        f1 = self.proj_s1(feat_s1)   # (B, fuse_dim, Z, H/2, W/2)
+        f2 = self.proj_s2(feat_s2)   # (B, fuse_dim, Z, H/4, W/4)
+        f3 = self.proj_s3(feat_final)  # (B, fuse_dim, Z, H/8, W/8)
+
+        # Align XY to target size via adaptive pooling (Z untouched)
+        if f1.shape[-2:] != (Hf, Wf):
+            f1 = F.adaptive_avg_pool3d(f1, (Z, Hf, Wf))
+        if f2.shape[-2:] != (Hf, Wf):
+            f2 = F.adaptive_avg_pool3d(f2, (Z, Hf, Wf))
+
+        # Concat along channel dim
+        fused = torch.cat([f1, f2, f3], dim=1)  # (B, 3*fuse_dim, Z, Hf, Wf)
+
+        # Final projection
+        return self.proj_out(fused)
 
 
 # ============================================================
@@ -663,7 +734,9 @@ class AnisotropicSwinEncoder3D(nn.Module):
                  drop_path_rate=0.1,
                  patch_norm=True,
                  use_checkpoint=False,
-                 out_dim=None):
+                 out_dim=None,
+                 use_fusion=False,
+                 fuse_dim=32):
         super().__init__()
 
         self.patch_size = tuple(patch_size)
@@ -672,7 +745,10 @@ class AnisotropicSwinEncoder3D(nn.Module):
         self.num_layers = len(depths)
         self.xy_stride = self.patch_size[1] * (2 ** (self.num_layers - 1))  # 2 * 2^2 = 8
         self.z_stride = self.patch_size[0]  # 1
-        self.out_channels = out_dim if out_dim is not None else int(embed_dim * 2 ** (self.num_layers - 1))
+        self.use_fusion = use_fusion
+
+        final_dim = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.out_channels = out_dim if out_dim is not None else final_dim
 
         norm_layer = nn.LayerNorm
 
@@ -719,11 +795,25 @@ class AnisotropicSwinEncoder3D(nn.Module):
         final_dim = int(embed_dim * 2 ** (self.num_layers - 1))
         self.norm = norm_layer(final_dim)
 
-        # Output projection if final dim != out_dim
-        if self.out_channels != final_dim:
-            self.proj_out = nn.Conv3d(final_dim, self.out_channels, kernel_size=1)
-        else:
+        # Multi-scale feature fusion
+        if use_fusion:
+            dims_s1 = int(embed_dim * 2 ** 0)   # embed_dim
+            dims_s2 = int(embed_dim * 2 ** 1)   # 2 * embed_dim
+            dims_s3 = final_dim                  # 4 * embed_dim
+            self.fusion = FeatureFusion3D(
+                dims=(dims_s1, dims_s2, dims_s3),
+                fuse_dim=fuse_dim,
+                out_dim=self.out_channels,
+            )
+            # When fusion is used, the output projection is redundant
+            # (fusion already projects to out_dim)
             self.proj_out = nn.Identity()
+        else:
+            self.fusion = None
+            if self.out_channels != final_dim:
+                self.proj_out = nn.Conv3d(final_dim, self.out_channels, kernel_size=1)
+            else:
+                self.proj_out = nn.Identity()
 
         self.apply(self._init_weights)
 
@@ -756,16 +846,30 @@ class AnisotropicSwinEncoder3D(nn.Module):
         x = self.patch_embed(x)  # (B, Z, ceil(H/2), ceil(W/2), embed_dim)
         x = self.pos_drop(x)
 
-        for layer in self.layers:
-            x = layer(x)  # channel-last throughout
+        intermediates_cf = []
+        for i, layer in enumerate(self.layers):
+            # Run blocks, capture pre-downsample feature
+            x = layer.forward_blocks(x)
+
+            if self.use_fusion and i < self.num_layers - 1:
+                # Convert to channel-first for fusion
+                intermediates_cf.append(
+                    x.permute(0, 4, 1, 2, 3).contiguous()
+                )
+
+            # Downsample if present
+            if layer.downsample is not None:
+                x = layer.downsample(x)
 
         # Final norm (channel-last)
         x = self.norm(x)  # (B, Z, Hf, Wf, C)
 
-        # Convert to channel-first for output
+        # Convert to channel-first
         x = x.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, Z, Hf, Wf)
 
-        # Optional output projection
+        # Feature fusion or simple output projection
+        if self.use_fusion and len(intermediates_cf) >= 2:
+            x = self.fusion(intermediates_cf[0], intermediates_cf[1], x)
         x = self.proj_out(x)
 
         return x
@@ -782,9 +886,11 @@ class MovingQuerySwinEncoder(nn.Module):
     Output: (B, K, out_dim, ceil(H/xy_stride), ceil(W/xy_stride))
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, use_fusion=False, fuse_dim=32, **kwargs):
         super().__init__()
-        self.encoder = AnisotropicSwinEncoder3D(in_chans=1, **kwargs)
+        self.encoder = AnisotropicSwinEncoder3D(
+            in_chans=1, use_fusion=use_fusion, fuse_dim=fuse_dim, **kwargs
+        )
 
     @property
     def xy_stride(self):
@@ -823,9 +929,11 @@ class ReferenceMemorySwinEncoder(nn.Module):
     Output: (B, out_dim, D, ceil(H/xy_stride), ceil(W/xy_stride))
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, use_fusion=False, fuse_dim=32, **kwargs):
         super().__init__()
-        self.encoder = AnisotropicSwinEncoder3D(in_chans=1, **kwargs)
+        self.encoder = AnisotropicSwinEncoder3D(
+            in_chans=1, use_fusion=use_fusion, fuse_dim=fuse_dim, **kwargs
+        )
 
     @property
     def xy_stride(self):

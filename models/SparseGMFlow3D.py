@@ -1606,6 +1606,10 @@ class CoarseMatchingNet(nn.Module):
         swin_drop_path_rate=0.1,
         swin_patch_norm=True,
         swin_use_checkpoint=False,
+
+        # Swin feature fusion
+        swin_use_fusion=False,
+        swin_fuse_dim=32,
     ):
         super().__init__()
 
@@ -1678,6 +1682,8 @@ class CoarseMatchingNet(nn.Module):
                 patch_norm=swin_patch_norm,
                 use_checkpoint=swin_use_checkpoint,
                 out_dim=dim,
+                use_fusion=swin_use_fusion,
+                fuse_dim=swin_fuse_dim,
             )
 
             self.reference_encoder = ReferenceMemorySwinEncoder(
@@ -1694,6 +1700,8 @@ class CoarseMatchingNet(nn.Module):
                 patch_norm=swin_patch_norm,
                 use_checkpoint=swin_use_checkpoint,
                 out_dim=dim,
+                use_fusion=swin_use_fusion,
+                fuse_dim=swin_fuse_dim,
             )
 
             # Validate strides

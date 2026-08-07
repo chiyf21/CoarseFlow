@@ -672,10 +672,7 @@ def total_coarse_loss(
             + lambda_match_ce * loss_match_ce
         )
 
-        if loss_mode == "match":
-            total = total + loss_match
-        else:
-            total = total + lambda_match * loss_match
+        total = total + lambda_match * loss_match
 
         loss_dict.update(match_metrics)
         loss_dict["loss_match"] = loss_match.detach()

@@ -1309,6 +1309,9 @@ class SameShapeBatchSampler(Sampler[List[int]]):
             pad_to_equal=self.pad_to_equal_batches,
         )
 
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
     def __iter__(self):
         self._build_batches()
         for batch in self.batches:

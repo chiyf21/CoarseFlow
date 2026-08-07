@@ -174,8 +174,7 @@ def train_one_epoch(
 ):
     model.train()
     base_model = unwrap_model(model)
-    if freeze_encoders:
-        keep_frozen_encoders_eval(model)
+    keep_frozen_modules_eval(model)
     running_loss = 0.0
     num_steps = 0
     t0 = time.time()
@@ -647,6 +646,8 @@ def train_coarse_matching_model(
     swin_drop_path_rate=0.1,
     swin_patch_norm=True,
     swin_use_checkpoint=False,
+    swin_use_fusion=False,
+    swin_fuse_dim=32,
 
     # checkpoint
     resume_path=None,
@@ -662,6 +663,10 @@ def train_coarse_matching_model(
     compute_chunk_match_loss=True,
     match_sigma=(0.5, 0.75, 0.75),
     match_inside_threshold=4.0,
+
+    # Cosine annealing
+    use_cosine_lr=False,
+    cosine_eta_min=1e-6,
 
     train_only_residual=False,
     freeze_encoder=False,
@@ -812,6 +817,8 @@ def train_coarse_matching_model(
         swin_drop_path_rate=swin_drop_path_rate,
         swin_patch_norm=swin_patch_norm,
         swin_use_checkpoint=swin_use_checkpoint,
+        swin_use_fusion=swin_use_fusion,
+        swin_fuse_dim=swin_fuse_dim,
 
 
     )
@@ -963,7 +970,20 @@ def train_coarse_matching_model(
                 logger.info("[Resume] checkpoint has no optimizer state; skip optimizer resume.")
 
     scaler = GradScaler(enabled=use_amp)
-    
+
+    # Cosine annealing scheduler
+    if use_cosine_lr:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs, eta_min=cosine_eta_min
+        )
+        if logger is not None:
+            logger.info(
+                f"[Scheduler] CosineAnnealingLR: "
+                f"lr={lr} -> {cosine_eta_min} over {num_epochs} epochs"
+            )
+    else:
+        scheduler = None
+
     end_epoch = start_epoch + num_epochs - 1
 
     if is_dist:
@@ -1007,8 +1027,14 @@ def train_coarse_matching_model(
             rank=rank,
             world_size=world_size,
         )
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+        else:
+            current_lr = optimizer.param_groups[0]["lr"]
+
         if main_process:
-            logger.info(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f}")
+            logger.info(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f}  lr={current_lr:.2e}")
 
             save_checkpoint(
                 save_path=os.path.join(save_dir, "latest.pth"),
@@ -1584,6 +1610,7 @@ def freeze_all_except_coord_residual(model, verbose=True, logger=None):
     """
     Freeze all parameters except coord_residual_refiner.
     Used for residual-only coordinate refinement.
+    Also sets frozen modules to eval mode to freeze BN/Dropout.
     """
     if not hasattr(model, "coord_residual_refiner") or model.coord_residual_refiner is None:
         raise ValueError(
@@ -1596,6 +1623,16 @@ def freeze_all_except_coord_residual(model, verbose=True, logger=None):
 
     for name, p in model.coord_residual_refiner.named_parameters():
         p.requires_grad_(True)
+
+    # Set frozen modules to eval mode (BN running stats frozen, Dropout disabled)
+    for name, module in model.named_modules():
+        if name == "" or name == "coord_residual_refiner":
+            continue
+        if any(name.startswith(prefix) for prefix in [
+            "moving_encoder", "reference_encoder", "matcher",
+            "query_proj", "ref_proj", "coord_mlp", "spacing_mlp",
+        ]):
+            module.eval()
 
     total = 0
     trainable = 0
@@ -1629,19 +1666,35 @@ def freeze_all_except_coord_residual(model, verbose=True, logger=None):
             if p.requires_grad:
                 print(" ", name)
 
-def keep_frozen_encoders_eval(model):
+def keep_frozen_modules_eval(model):
     """
-    Call this after model.train() if encoders are frozen.
+    Call this after model.train() to restore eval mode on frozen submodules.
+    Works with both raw models and DDP-wrapped models.
+    Any direct child module whose all parameters are frozen gets set to eval.
     """
-    if hasattr(model, "moving_encoder"):
-        frozen = all(not p.requires_grad for p in model.moving_encoder.parameters())
-        if frozen:
-            model.moving_encoder.eval()
+    if isinstance(model, DDP):
+        base = model.module
+    else:
+        base = model
 
-    if hasattr(model, "reference_encoder"):
-        frozen = all(not p.requires_grad for p in model.reference_encoder.parameters())
+    # Known trainable submodule names that might stay in train mode
+    frozen_check_names = [
+        "moving_encoder", "reference_encoder", "matcher",
+        "query_proj", "ref_proj", "coord_mlp", "spacing_mlp",
+    ]
+    for name in frozen_check_names:
+        if not hasattr(base, name):
+            continue
+        mod = getattr(base, name)
+        try:
+            frozen = all(not p.requires_grad for p in mod.parameters())
+        except Exception:
+            continue
         if frozen:
-            model.reference_encoder.eval()
+            mod.eval()
+
+# Backward compatibility alias
+keep_frozen_encoders_eval = keep_frozen_modules_eval
 #############################    inference  ##############################################
 @torch.no_grad()
 def inference(
