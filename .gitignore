@@ -1,4 +1,6 @@
 scripys/checkpoints/
+checkpoints/
 cached_datasets/
 *.log
 /figures/
+/ARCHITECTURE.md

@@ -3,16 +3,18 @@
 import os
 import time
 import torch
-import torch_npu
-from torch_npu.contrib import transfer_to_npu
+
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+    from torch_npu.npu.amp import autocast, GradScaler
+except ImportError:
+    torch_npu = None
+    from torch.cuda.amp import autocast, GradScaler
 
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
-try:
-    from torch_npu.npu.amp import autocast, GradScaler
-except Exception:
-    from torch.cuda.amp import autocast, GradScaler
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,8 +33,16 @@ def setup_distributed():
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
-    torch.npu.set_device(local_rank)
-    dist.init_process_group(backend="hccl")
+    if torch_npu is not None and hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.set_device(local_rank)
+        dist.init_process_group(backend="hccl")
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    else:
+        raise RuntimeError(
+            "setup_distributed: neither NPU nor CUDA is available."
+        )
 
     return True, rank, world_size, local_rank
 
@@ -622,6 +632,22 @@ def train_coarse_matching_model(
     matcher_proj_drop=0.0,
     matcher_init_gamma=1e-3,
 
+    # Swin encoder
+    encoder_type="legacy",  # "legacy" or "swin3d"
+    swin_patch_size=(1, 2, 2),
+    swin_embed_dim=24,
+    swin_depths=(2, 2, 6),
+    swin_num_heads=(3, 6, 12),
+    moving_swin_window_sizes=((2, 4, 4), (2, 4, 4), (2, 4, 4)),
+    ref_swin_window_sizes=((2, 4, 4), (2, 4, 4), (4, 4, 4)),
+    swin_mlp_ratio=4.0,
+    swin_qkv_bias=True,
+    swin_drop_rate=0.0,
+    swin_attn_drop_rate=0.0,
+    swin_drop_path_rate=0.1,
+    swin_patch_norm=True,
+    swin_use_checkpoint=False,
+
     # checkpoint
     resume_path=None,
     resume_optimizer=False,
@@ -770,7 +796,23 @@ def train_coarse_matching_model(
         residual_use_disp=residual_use_disp,
         residual_detach_coarse=residual_detach_coarse,
         residual_detach_features=residual_detach_features,
-        
+
+        # Swin encoder
+        encoder_type=encoder_type,
+        swin_patch_size=swin_patch_size,
+        swin_embed_dim=swin_embed_dim,
+        swin_depths=swin_depths,
+        swin_num_heads=swin_num_heads,
+        moving_swin_window_sizes=moving_swin_window_sizes,
+        ref_swin_window_sizes=ref_swin_window_sizes,
+        swin_mlp_ratio=swin_mlp_ratio,
+        swin_qkv_bias=swin_qkv_bias,
+        swin_drop_rate=swin_drop_rate,
+        swin_attn_drop_rate=swin_attn_drop_rate,
+        swin_drop_path_rate=swin_drop_path_rate,
+        swin_patch_norm=swin_patch_norm,
+        swin_use_checkpoint=swin_use_checkpoint,
+
 
     )
     

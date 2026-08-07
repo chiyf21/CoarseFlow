@@ -6,8 +6,12 @@ import json
 from pathlib import Path
 
 import torch
-import torch_npu
-from torch_npu.contrib import transfer_to_npu
+
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
 
 
 # ============================================================
@@ -143,6 +147,24 @@ def main():
         matcher_init_gamma=1e-2,
 
         # =====================================================
+        # Swin3D encoder
+        # =====================================================
+        encoder_type="swin3d",
+        swin_patch_size=(1, 2, 2),
+        swin_embed_dim=24,
+        swin_depths=(2, 2, 6),
+        swin_num_heads=(3, 6, 12),
+        moving_swin_window_sizes=((2, 4, 4), (2, 4, 4), (2, 4, 4)),
+        ref_swin_window_sizes=((2, 4, 4), (2, 4, 4), (4, 4, 4)),
+        swin_mlp_ratio=4.0,
+        swin_qkv_bias=True,
+        swin_drop_rate=0.0,
+        swin_attn_drop_rate=0.0,
+        swin_drop_path_rate=0.1,
+        swin_patch_norm=True,
+        swin_use_checkpoint=True,
+
+        # =====================================================
         # Spatial coordinate residual refinement: ON for Stage 4
         # =====================================================
         # Keep num_refine_iters=1 above. This avoids the memory increase
@@ -235,7 +257,7 @@ def main():
         train_loader=train_loader_stage3,
         val_loader=val_loader_stage3,
 
-        save_dir="checkpoints/coarseflow_v7_stage5_spatial_residual",
+        save_dir="checkpoints/coarseflow_swin3d_v1_stage5",
 
         num_epochs=600,
         lr=1e-4,
@@ -268,7 +290,7 @@ def main():
         match_sigma=(0.4, 0.6, 0.6),
         match_inside_threshold=4.0,
 
-        resume_path="checkpoints/coarseflow_v7_stage4_MoreData_sharpen/best.pth",
+        resume_path="checkpoints/coarseflow_swin3d_v1_stage4/best.pth",
         resume_optimizer=False,
         resume_best_val_loss=False,
         strict_load=False,

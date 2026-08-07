@@ -7,10 +7,19 @@
 
 import math
 import torch
-import torch_npu
-from torch_npu.contrib import transfer_to_npu
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
+
+from models.swin3d_aniso import (
+    MovingQuerySwinEncoder,
+    ReferenceMemorySwinEncoder,
+)
 
 
 # ============================================================
@@ -1207,21 +1216,15 @@ class LocalQueryToVolumeMatcher(nn.Module):
             rel_offset_norm=rel_offset_norm,
         )
 
+        # Apply temperature scaling once so that both the coordinate expectation
+        # and the downstream match loss (KL/CE) operate on the same distribution.
+        scores = scores / max(float(self.coord_temperature), 1e-6)
         scores = scores.masked_fill(~candidate_valid_mask, -1e4)
 
-        # Match probability used for CE/KL diagnostics and returned aux.
         prob = torch.softmax(scores, dim=-1)
 
-        # Sharper probability used only for coordinate expectation.
-        # This keeps the output differentiable, but reduces the conservative
-        # averaging effect of a soft distribution.
-        prob_coord = torch.softmax(
-            scores / max(float(self.coord_temperature), 1e-6),
-            dim=-1,
-        )
-
         pred_coords = self.coordinate_expectation(
-            prob=prob_coord,
+            prob=prob,
             candidate_coords=candidate_coords,
         )
 
@@ -1585,6 +1588,24 @@ class CoarseMatchingNet(nn.Module):
         residual_detach_features=True,
         residual_num_blocks=3,
         residual_use_3d=True,
+
+        # Swin encoder type
+        encoder_type="legacy",  # "legacy" or "swin3d"
+
+        # Swin encoder config
+        swin_patch_size=(1, 2, 2),
+        swin_embed_dim=24,
+        swin_depths=(2, 2, 6),
+        swin_num_heads=(3, 6, 12),
+        moving_swin_window_sizes=((2, 4, 4), (2, 4, 4), (2, 4, 4)),
+        ref_swin_window_sizes=((2, 4, 4), (2, 4, 4), (4, 4, 4)),
+        swin_mlp_ratio=4.0,
+        swin_qkv_bias=True,
+        swin_drop_rate=0.0,
+        swin_attn_drop_rate=0.0,
+        swin_drop_path_rate=0.1,
+        swin_patch_norm=True,
+        swin_use_checkpoint=False,
     ):
         super().__init__()
 
@@ -1593,6 +1614,7 @@ class CoarseMatchingNet(nn.Module):
         self.control_stride = int(control_stride)
         self.encoder_stride = int(encoder_stride)
         self.query_chunk_size = int(query_chunk_size)
+        self.encoder_type = encoder_type
 
         self.use_coord_embed = bool(use_coord_embed)
         self.use_spacing_embed = bool(use_spacing_embed)
@@ -1614,31 +1636,91 @@ class CoarseMatchingNet(nn.Module):
         # ----------------------------------------------------
         # 1. Moving and reference encoders
         # ----------------------------------------------------
-        self.moving_encoder = MovingQueryEncoder(
-            in_ch=1,
-            dim=dim,
-            base_channels=moving_base_channels,
-            num_blocks=moving_num_blocks,
-            mlp_ratio=moving_mlp_ratio,
-            use_window_attn=moving_window_attn_layers > 0,
-            window_attn_layers=moving_window_attn_layers,
-            window_size=moving_window_size,
-            num_heads=moving_attn_num_heads,
-            slice_fusion_blocks=moving_slice_fusion_blocks,
-        )
+        if encoder_type == "legacy":
+            self.moving_encoder = MovingQueryEncoder(
+                in_ch=1,
+                dim=dim,
+                base_channels=moving_base_channels,
+                num_blocks=moving_num_blocks,
+                mlp_ratio=moving_mlp_ratio,
+                use_window_attn=moving_window_attn_layers > 0,
+                window_attn_layers=moving_window_attn_layers,
+                window_size=moving_window_size,
+                num_heads=moving_attn_num_heads,
+                slice_fusion_blocks=moving_slice_fusion_blocks,
+            )
 
-        self.reference_encoder = ReferenceMemoryEncoder(
-            in_ch=1,
-            dim=dim,
-            base_channels=ref_base_channels,
-            num_blocks=ref_num_blocks,
-            refine_blocks=ref_refine_blocks,
-            mlp_ratio=ref_mlp_ratio,
-            attn_layers=ref_attn_layers,
-            attn_num_heads=ref_attn_num_heads,
-            attn_window_size=ref_attn_window_size,
-            attn_mlp_ratio=ref_attn_mlp_ratio,
-        )
+            self.reference_encoder = ReferenceMemoryEncoder(
+                in_ch=1,
+                dim=dim,
+                base_channels=ref_base_channels,
+                num_blocks=ref_num_blocks,
+                refine_blocks=ref_refine_blocks,
+                mlp_ratio=ref_mlp_ratio,
+                attn_layers=ref_attn_layers,
+                attn_num_heads=ref_attn_num_heads,
+                attn_window_size=ref_attn_window_size,
+                attn_mlp_ratio=ref_attn_mlp_ratio,
+            )
+
+        elif encoder_type == "swin3d":
+            self.moving_encoder = MovingQuerySwinEncoder(
+                patch_size=swin_patch_size,
+                embed_dim=swin_embed_dim,
+                depths=swin_depths,
+                num_heads=swin_num_heads,
+                window_sizes=moving_swin_window_sizes,
+                mlp_ratio=swin_mlp_ratio,
+                qkv_bias=swin_qkv_bias,
+                drop_rate=swin_drop_rate,
+                attn_drop_rate=swin_attn_drop_rate,
+                drop_path_rate=swin_drop_path_rate,
+                patch_norm=swin_patch_norm,
+                use_checkpoint=swin_use_checkpoint,
+                out_dim=dim,
+            )
+
+            self.reference_encoder = ReferenceMemorySwinEncoder(
+                patch_size=swin_patch_size,
+                embed_dim=swin_embed_dim,
+                depths=swin_depths,
+                num_heads=swin_num_heads,
+                window_sizes=ref_swin_window_sizes,
+                mlp_ratio=swin_mlp_ratio,
+                qkv_bias=swin_qkv_bias,
+                drop_rate=swin_drop_rate,
+                attn_drop_rate=swin_attn_drop_rate,
+                drop_path_rate=swin_drop_path_rate,
+                patch_norm=swin_patch_norm,
+                use_checkpoint=swin_use_checkpoint,
+                out_dim=dim,
+            )
+
+            # Validate strides
+            if self.moving_encoder.xy_stride != encoder_stride:
+                raise ValueError(
+                    f"moving_encoder.xy_stride={self.moving_encoder.xy_stride} "
+                    f"!= encoder_stride={encoder_stride}"
+                )
+            if self.reference_encoder.xy_stride != encoder_stride:
+                raise ValueError(
+                    f"reference_encoder.xy_stride={self.reference_encoder.xy_stride} "
+                    f"!= encoder_stride={encoder_stride}"
+                )
+            if self.moving_encoder.z_stride != 1:
+                raise ValueError(
+                    f"moving_encoder.z_stride={self.moving_encoder.z_stride} != 1"
+                )
+            if self.reference_encoder.z_stride != 1:
+                raise ValueError(
+                    f"reference_encoder.z_stride={self.reference_encoder.z_stride} != 1"
+                )
+
+        else:
+            raise ValueError(
+                f"Unknown encoder_type={encoder_type}. "
+                f"Expected 'legacy' or 'swin3d'."
+            )
 
         # ----------------------------------------------------
         # 2. Local matcher
