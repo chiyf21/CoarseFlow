@@ -1541,6 +1541,7 @@ class CoarseMatchingNet(nn.Module):
         encoder_stride=8,
         matcher_mode="hybrid",
         query_chunk_size=512,
+        query_downsample_mode="avg",
 
         # Moving encoder
         moving_base_channels=(24, 48, 96),
@@ -1635,7 +1636,75 @@ class CoarseMatchingNet(nn.Module):
                 f"encoder_stride={encoder_stride}."
             )
 
-        self.query_downsample = self.control_stride // self.encoder_stride
+        self.query_downsample = (
+            self.control_stride // self.encoder_stride
+        )
+
+        self.query_downsample_mode = str(
+            query_downsample_mode
+        ).lower()
+
+        if self.query_downsample_mode not in {
+            "avg",
+            "learned",
+        }:
+            raise ValueError(
+                "query_downsample_mode must be "
+                "'avg' or 'learned', "
+                f"got {query_downsample_mode}"
+            )
+
+        # ----------------------------------------------------
+        # Learnable query downsampling
+        # ----------------------------------------------------
+        if self.query_downsample_mode == "learned":
+
+            factor = int(self.query_downsample)
+
+            if factor < 1:
+                raise ValueError(
+                    f"Invalid query_downsample factor={factor}"
+                )
+
+            if factor == 1:
+                self.query_downsample_proj = nn.Identity()
+
+            else:
+                # Require power-of-two downsampling.
+                if factor & (factor - 1):
+                    raise ValueError(
+                        "learned query downsampling currently requires "
+                        "control_stride / encoder_stride to be "
+                        f"a power of 2, got {factor}"
+                    )
+
+                num_down = int(math.log2(factor))
+
+                layers = []
+
+                for _ in range(num_down):
+                    layers.extend(
+                        [
+                            nn.Conv3d(
+                                dim,
+                                dim,
+                                kernel_size=(1, 3, 3),
+                                stride=(1, 2, 2),
+                                padding=(0, 1, 1),
+                                bias=False,
+                            ),
+                            nn.GroupNorm(8, dim),
+                            nn.GELU(),
+                        ]
+                    )
+
+                self.query_downsample_proj = nn.Sequential(
+                    *layers
+                )
+
+        else:
+            # Preserve original behavior/checkpoint compatibility.
+            self.query_downsample_proj = None
 
         # ----------------------------------------------------
         # 1. Moving and reference encoders
@@ -1917,30 +1986,96 @@ class CoarseMatchingNet(nn.Module):
             dim=-1,
         )
 
-    def downsample_query_features(self, F_mov, input_hw):
+    def downsample_query_features(
+        self,
+        F_mov,
+        input_hw,
+    ):
         """
-        F_mov: (B,K,C,Hf,Wf)
-        input_hw: raw moving H,W
+        Convert encoder-resolution moving features to the
+        control-point resolution.
 
-        Return: (B,K,C,ceil(H/control_stride),ceil(W/control_stride))
+        Args
+        ----
+        F_mov:
+            (B, K, C, Hf, Wf)
 
-        For the default setting, moving encoder output stride and
-        control_stride are both 8, so this is usually shape-preserving.
+        input_hw:
+            raw moving image (H, W)
+
+        Returns
+        -------
+        (B, K, C, Hc, Wc)
+
+        Modes
+        -----
+        avg:
+            Original adaptive-average-pooling behavior.
+            Kept for backward compatibility.
+
+        learned:
+            Learnable XY-only strided projection.
+            Recommended for Swin V2.
         """
+
         H, W = input_hw
-        target_h = math.ceil(H / self.control_stride)
-        target_w = math.ceil(W / self.control_stride)
+
+        target_h = math.ceil(
+            H / self.control_stride
+        )
+        target_w = math.ceil(
+            W / self.control_stride
+        )
 
         B, K, C, Hf, Wf = F_mov.shape
 
-        x = F_mov.permute(0, 2, 1, 3, 4).contiguous()  # (B,C,K,Hf,Wf)
-        x = F.adaptive_avg_pool3d(x, output_size=(K, target_h, target_w))
+        x = F_mov.permute(
+            0, 2, 1, 3, 4
+        ).contiguous()
+        # (B, C, K, Hf, Wf)
 
-        return x.permute(0, 2, 1, 3, 4).contiguous()
+        if self.query_downsample_mode == "avg":
 
-    # ========================================================
-    # Forward
-    # ========================================================
+            x = F.adaptive_avg_pool3d(
+                x,
+                output_size=(
+                    K,
+                    target_h,
+                    target_w,
+                ),
+            )
+
+        elif self.query_downsample_mode == "learned":
+
+            x = self.query_downsample_proj(x)
+
+            if x.shape[-2:] != (
+                target_h,
+                target_w,
+            ):
+                raise RuntimeError(
+                    "Learned query downsampling shape mismatch: "
+                    f"got {tuple(x.shape[-2:])}, "
+                    f"expected {(target_h, target_w)}. "
+                    f"raw={(H, W)}, "
+                    f"encoder={(Hf, Wf)}, "
+                    f"control_stride={self.control_stride}, "
+                    f"encoder_stride={self.encoder_stride}"
+                )
+
+        else:
+            raise RuntimeError(
+                "Unexpected query_downsample_mode="
+                f"{self.query_downsample_mode}"
+            )
+
+        return x.permute(
+            0, 2, 1, 3, 4
+        ).contiguous()
+
+        # ========================================================
+        # Forward
+        # ========================================================
 
     def forward(
         self,

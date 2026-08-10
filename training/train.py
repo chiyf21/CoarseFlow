@@ -540,6 +540,7 @@ def save_checkpoint(
     epoch,
     best_val_loss=None,
     model_config=None,
+    scheduler=None,
 ):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -547,6 +548,11 @@ def save_checkpoint(
         "epoch": epoch,
         "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
+        "scheduler": (
+            scheduler.state_dict()
+            if scheduler is not None
+            else None
+        ),
         "best_val_loss": best_val_loss,
         "model_config": model_config,
     }
@@ -580,11 +586,13 @@ def train_coarse_matching_model(
     dim=96,
     radius=(4, 3, 3),
     temperature=0.05,
+    coord_temperature=0.5,
     use_learned_matching=True,
     control_stride=8,
     num_refine_iters=1,
     encoder_stride=8,
     query_chunk_size=512,
+    query_downsample_mode="avg",
     matcher_mode="hybrid",
 
     
@@ -666,6 +674,7 @@ def train_coarse_matching_model(
 
     # Cosine annealing
     use_cosine_lr=False,
+    cosine_start_epoch=0,
     cosine_eta_min=1e-6,
 
     train_only_residual=False,
@@ -749,13 +758,14 @@ def train_coarse_matching_model(
         dim=dim,
         radius=radius,
         temperature=temperature,
+        coord_temperature=coord_temperature,
         use_learned_matching=use_learned_matching,
         matcher_mode=matcher_mode,
         control_stride=control_stride,
         num_refine_iters=num_refine_iters,
         encoder_stride=encoder_stride,
         query_chunk_size=query_chunk_size,
-
+        query_downsample_mode=query_downsample_mode,
         # moving encoder config
         moving_base_channels=moving_base_channels,
         moving_num_blocks=moving_num_blocks,
@@ -862,6 +872,7 @@ def train_coarse_matching_model(
             logger.info(f"[Resume] start_epoch = {start_epoch}")
     else:
         best_val_loss = float("inf")
+
     # ----------------------------------------------------
     # Freeze / trainable parameter control
     # ----------------------------------------------------
@@ -973,17 +984,91 @@ def train_coarse_matching_model(
 
     # Cosine annealing scheduler
     if use_cosine_lr:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=num_epochs, eta_min=cosine_eta_min
+
+        cosine_start_epoch = int(
+            cosine_start_epoch
         )
+
+        if cosine_start_epoch < 0:
+            raise ValueError(
+                "cosine_start_epoch must be >= 0"
+            )
+
+        if cosine_start_epoch >= num_epochs:
+            raise ValueError(
+                "cosine_start_epoch must be < num_epochs"
+            )
+
+        if cosine_start_epoch == 0:
+
+            scheduler = (
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=num_epochs,
+                    eta_min=cosine_eta_min,
+                )
+            )
+
+        else:
+
+            constant_scheduler = (
+                torch.optim.lr_scheduler.ConstantLR(
+                    optimizer,
+                    factor=1.0,
+                    total_iters=cosine_start_epoch,
+                )
+            )
+
+            cosine_scheduler = (
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=(
+                        num_epochs
+                        - cosine_start_epoch
+                    ),
+                    eta_min=cosine_eta_min,
+                )
+            )
+
+            scheduler = (
+                torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[
+                        constant_scheduler,
+                        cosine_scheduler,
+                    ],
+                    milestones=[
+                        cosine_start_epoch
+                    ],
+                )
+            )
+
         if logger is not None:
             logger.info(
-                f"[Scheduler] CosineAnnealingLR: "
-                f"lr={lr} -> {cosine_eta_min} over {num_epochs} epochs"
+                "[Scheduler] "
+                f"base_lr={lr}, "
+                f"cosine_start_epoch={cosine_start_epoch}, "
+                f"eta_min={cosine_eta_min}, "
+                f"total_epochs={num_epochs}"
             )
+
     else:
         scheduler = None
+    if (
+        resume_path is not None
+        and resume_optimizer
+        and scheduler is not None
+        and "scheduler" in ckpt
+        and ckpt["scheduler"] is not None
+    ):
+        scheduler.load_state_dict(
+            ckpt["scheduler"]
+        )
 
+        if logger is not None:
+            logger.info(
+                "[Resume] scheduler state loaded."
+            )
     end_epoch = start_epoch + num_epochs - 1
 
     if is_dist:
@@ -996,11 +1081,29 @@ def train_coarse_matching_model(
         )
 
     for epoch in range(start_epoch, end_epoch + 1):
-        if is_dist:
-            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
-                train_loader.sampler.set_epoch(epoch)
-            if hasattr(train_loader, "batch_sampler") and hasattr(train_loader.batch_sampler, "set_epoch"):
-                train_loader.batch_sampler.set_epoch(epoch)
+        if (
+            is_dist
+            and hasattr(train_loader, "sampler")
+            and hasattr(
+                train_loader.sampler,
+                "set_epoch",
+            )
+        ):
+            train_loader.sampler.set_epoch(epoch)
+
+        # Custom SameShapeBatchSampler should change
+        # ordering EVERY epoch, even on one GPU.
+        if (
+            hasattr(train_loader, "batch_sampler")
+            and hasattr(
+                train_loader.batch_sampler,
+                "set_epoch",
+            )
+        ):
+            train_loader.batch_sampler.set_epoch(
+                epoch
+            )
+
         train_loss = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -1043,6 +1146,7 @@ def train_coarse_matching_model(
                 epoch=epoch,
                 best_val_loss=best_val_loss,
                 model_config=model_config,
+                scheduler=scheduler
             )
         if is_dist:
             dist.barrier()
@@ -1081,6 +1185,7 @@ def train_coarse_matching_model(
                         epoch=epoch,
                         best_val_loss=best_val_loss,
                         model_config=model_config,
+                        scheduler=scheduler
                     )
 
                     if logger is not None:

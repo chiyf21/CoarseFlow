@@ -269,7 +269,7 @@ class SwinTransformerBlock3D(nn.Module):
                   0 = keep, -100 = mask out.
             None if no shift.
         """
-        if all(s == 0 for s in self.shift_size):
+        if sz == 0 and sy == 0 and sx == 0:
             return None
 
         Wz, Wy, Wx = self.window_size
@@ -356,44 +356,91 @@ class SwinTransformerBlock3D(nn.Module):
         x = self.norm1(x)
 
         # --------------------------------------------------------
-        # 1. Cyclic shift
-        # --------------------------------------------------------
-        if any(s > 0 for s in (sz, sy, sx)):
-            shifted_x = torch.roll(x, shifts=(-sz, -sy, -sx), dims=(1, 2, 3))
-        else:
-            shifted_x = x
-
-        # --------------------------------------------------------
-        # 2. Pad to window multiples
+        # 1. Pad FIRST to window multiples
         # --------------------------------------------------------
         pad_z = (Wz - Z % Wz) % Wz
         pad_h = (Wy - H % Wy) % Wy
         pad_w = (Wx - W % Wx) % Wx
 
-        need_pad = pad_z > 0 or pad_h > 0 or pad_w > 0
+        need_pad = (
+            pad_z > 0
+            or pad_h > 0
+            or pad_w > 0
+        )
+
+        # Real/padding mask in the SAME coordinate system as x
+        padding_mask = torch.ones(
+            B,
+            Z,
+            H,
+            W,
+            device=x.device,
+            dtype=torch.float32,
+        )
+
         if need_pad:
-            # Pad in channel-first then convert back
-            shifted_x_cf = shifted_x.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, Z, H, W)
-            shifted_x_cf = F.pad(shifted_x_cf, (0, pad_w, 0, pad_h, 0, pad_z))
-            shifted_x = shifted_x_cf.permute(0, 2, 3, 4, 1).contiguous()  # (B, Zp, Hp, Wp, C)
+            x_cf = x.permute(
+                0, 4, 1, 2, 3
+            ).contiguous()
 
-            # Padding mask
-            padding_mask = torch.ones(B, Z, H, W, device=x.device, dtype=torch.float32)
-            # Pad to (B, Zp, Hp, Wp)
-            padding_mask = F.pad(padding_mask, (0, pad_w, 0, pad_h, 0, pad_z), value=0.0)
+            x_cf = F.pad(
+                x_cf,
+                (0, pad_w, 0, pad_h, 0, pad_z),
+                mode="constant",
+                value=0.0,
+            )
+
+            x_pad = x_cf.permute(
+                0, 2, 3, 4, 1
+            ).contiguous()
+
+            padding_mask = F.pad(
+                padding_mask,
+                (0, pad_w, 0, pad_h, 0, pad_z),
+                value=0.0,
+            )
+
         else:
-            padding_mask = torch.ones(B, Z, H, W, device=x.device, dtype=torch.float32)
+            x_pad = x
 
-        Zp, Hp, Wp = shifted_x.shape[1:4]
+        Zp, Hp, Wp = x_pad.shape[1:4]
+
+        # --------------------------------------------------------
+        # 2. Cyclic shift AFTER padding
+        # --------------------------------------------------------
+        if any(s > 0 for s in (sz, sy, sx)):
+
+            shifted_x = torch.roll(
+                x_pad,
+                shifts=(-sz, -sy, -sx),
+                dims=(1, 2, 3),
+            )
+
+            # Padding locations must shift together with features.
+            padding_mask = torch.roll(
+                padding_mask,
+                shifts=(-sz, -sy, -sx),
+                dims=(1, 2, 3),
+            )
+
+        else:
+            shifted_x = x_pad
 
         # --------------------------------------------------------
         # 3. Window partition
         # --------------------------------------------------------
-        x_windows = window_partition_3d(shifted_x, self.window_size)
-        # (B * nW, Wz, Wy, Wx, C)
-        nW_total = x_windows.shape[0]
-        x_windows = x_windows.view(nW_total, N, C)
+        x_windows = window_partition_3d(
+            shifted_x,
+            self.window_size,
+        )
 
+        nW_total = x_windows.shape[0]
+
+        x_windows = x_windows.view(
+            nW_total,
+            N,
+            C,
+        )
         # --------------------------------------------------------
         # 4. Build attention mask
         # --------------------------------------------------------
@@ -428,19 +475,24 @@ class SwinTransformerBlock3D(nn.Module):
         shifted_x = window_reverse_3d(attn_windows, self.window_size,
                                       B, Zp, Hp, Wp)
 
-        # --------------------------------------------------------
-        # 7. Crop padding
-        # --------------------------------------------------------
-        if need_pad:
-            shifted_x = shifted_x[:, :Z, :H, :W, :]
 
         # --------------------------------------------------------
-        # 8. Reverse cyclic shift
+        # 7. Reverse cyclic shift on the padded lattice
         # --------------------------------------------------------
         if any(s > 0 for s in (sz, sy, sx)):
-            x = torch.roll(shifted_x, shifts=(sz, sy, sx), dims=(1, 2, 3))
+            x = torch.roll(
+                shifted_x,
+                shifts=(sz, sy, sx),
+                dims=(1, 2, 3),
+            )
         else:
             x = shifted_x
+
+        # --------------------------------------------------------
+        # 8. Crop padding AFTER reversing the shift
+        # --------------------------------------------------------
+        if need_pad:
+            x = x[:, :Z, :H, :W, :]
 
         # --------------------------------------------------------
         # 9. Residual + MLP
@@ -636,66 +688,209 @@ class BasicLayer3D(nn.Module):
 # FeatureFusion3D
 # ============================================================
 
-class FeatureFusion3D(nn.Module):
-    """Multi-scale feature fusion for 3D anisotropic encoder.
+class XYDownsampleBlock(nn.Module):
+    """
+    Learnable XY-only downsampling.
 
-    Fuses features from 1/2, 1/4, and 1/8 XY resolutions.
-    Projects each to a unified fuse_dim, aligns XY with pooling,
-    then concats and projects to out_dim.
+    Spatial:
+        (Z, H, W) -> (Z, ceil(H/2), ceil(W/2))
 
-    All fusion operations are XY-only; Z dimension is untouched.
+    Z is untouched.
     """
 
-    def __init__(self, dims=(24, 48, 96), fuse_dim=32, out_dim=96):
+    def __init__(self, channels):
         super().__init__()
-        self.fuse_dim = fuse_dim
-        self.out_dim = out_dim
 
-        # 1x1x1 Conv3d projections for each scale
-        self.proj_s1 = nn.Conv3d(dims[0], fuse_dim, kernel_size=1)
-        self.proj_s2 = nn.Conv3d(dims[1], fuse_dim, kernel_size=1)
-        self.proj_s3 = nn.Conv3d(dims[2], fuse_dim, kernel_size=1)
+        num_groups = 8 if channels % 8 == 0 else 1
 
-        # Final mix after concat
-        self.proj_out = nn.Conv3d(fuse_dim * 3, out_dim, kernel_size=1)
+        self.block = nn.Sequential(
+            nn.Conv3d(
+                channels,
+                channels,
+                kernel_size=(1, 3, 3),
+                stride=(1, 2, 2),
+                padding=(0, 1, 1),
+                bias=False,
+            ),
+            nn.GroupNorm(num_groups, channels),
+            nn.GELU(),
+        )
 
-        self._init_weights()
+    def forward(self, x):
+        return self.block(x)
 
-    def _init_weights(self):
-        for m in [self.proj_s1, self.proj_s2, self.proj_s3, self.proj_out]:
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
-    def forward(self, feat_s1, feat_s2, feat_final):
-        """
-        Args:
-            feat_s1:   (B, dims[0], Z, H/2, W/2)  channel-first
-            feat_s2:   (B, dims[1], Z, H/4, W/4)  channel-first
-            feat_final:(B, dims[2], Z, H/8, W/8)  channel-first
+class FeatureFusion3D(nn.Module):
+    """
+    Residual multi-scale feature fusion.
 
-        Returns:
-            (B, out_dim, Z, H/8, W/8)  channel-first
-        """
-        # Target spatial size
-        _, _, Z, Hf, Wf = feat_final.shape
+    Inputs:
+        feat_s1:
+            /2 XY feature
+            (B, dims[0], Z, H/2, W/2)
 
-        # Project each scale
-        f1 = self.proj_s1(feat_s1)   # (B, fuse_dim, Z, H/2, W/2)
-        f2 = self.proj_s2(feat_s2)   # (B, fuse_dim, Z, H/4, W/4)
-        f3 = self.proj_s3(feat_final)  # (B, fuse_dim, Z, H/8, W/8)
+        feat_s2:
+            /4 XY feature
+            (B, dims[1], Z, H/4, W/4)
 
-        # Align XY to target size via adaptive pooling (Z untouched)
-        if f1.shape[-2:] != (Hf, Wf):
-            f1 = F.adaptive_avg_pool3d(f1, (Z, Hf, Wf))
-        if f2.shape[-2:] != (Hf, Wf):
-            f2 = F.adaptive_avg_pool3d(f2, (Z, Hf, Wf))
+        feat_final:
+            /8 XY feature
+            (B, dims[2], Z, H/8, W/8)
 
-        # Concat along channel dim
-        fused = torch.cat([f1, f2, f3], dim=1)  # (B, 3*fuse_dim, Z, Hf, Wf)
+    Output:
+        fused /8 feature
+        (B, out_dim, Z, H/8, W/8)
 
-        # Final projection
-        return self.proj_out(fused)
+    Design:
+        1. /2 and /4 features are projected and learnably downsampled.
+        2. The full /8 feature is preserved instead of compressed to fuse_dim.
+        3. Multi-scale information predicts a residual correction.
+        4. Final output = base /8 feature + gamma * residual.
+    """
+
+    def __init__(
+        self,
+        dims=(24, 48, 96),
+        fuse_dim=32,
+        out_dim=96,
+    ):
+        super().__init__()
+
+        self.fuse_dim = int(fuse_dim)
+        self.out_dim = int(out_dim)
+
+        fuse_groups = 8 if self.fuse_dim % 8 == 0 else 1
+        out_groups = 8 if self.out_dim % 8 == 0 else 1
+
+        # --------------------------------------------------
+        # /2 branch
+        # --------------------------------------------------
+        self.proj_s1 = nn.Sequential(
+            nn.Conv3d(
+                dims[0],
+                self.fuse_dim,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.GroupNorm(fuse_groups, self.fuse_dim),
+            nn.GELU(),
+        )
+
+        # /2 -> /4 -> /8
+        self.down_s1 = nn.Sequential(
+            XYDownsampleBlock(self.fuse_dim),
+            XYDownsampleBlock(self.fuse_dim),
+        )
+
+        # --------------------------------------------------
+        # /4 branch
+        # --------------------------------------------------
+        self.proj_s2 = nn.Sequential(
+            nn.Conv3d(
+                dims[1],
+                self.fuse_dim,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.GroupNorm(fuse_groups, self.fuse_dim),
+            nn.GELU(),
+        )
+
+        # /4 -> /8
+        self.down_s2 = XYDownsampleBlock(self.fuse_dim)
+
+        # --------------------------------------------------
+        # Preserve full /8 branch
+        # --------------------------------------------------
+        if dims[2] == self.out_dim:
+            self.base_proj = nn.Identity()
+        else:
+            self.base_proj = nn.Conv3d(
+                dims[2],
+                self.out_dim,
+                kernel_size=1,
+                bias=False,
+            )
+
+        # --------------------------------------------------
+        # Multi-scale residual predictor
+        #
+        # Important:
+        # keep full out_dim-dimensional /8 feature here.
+        # Do NOT compress /8 from 96 -> 32.
+        # --------------------------------------------------
+        fusion_in_dim = (
+            self.fuse_dim
+            + self.fuse_dim
+            + self.out_dim
+        )
+
+        self.mix = nn.Sequential(
+            nn.Conv3d(
+                fusion_in_dim,
+                self.out_dim,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.GroupNorm(out_groups, self.out_dim),
+            nn.GELU(),
+            nn.Conv3d(
+                self.out_dim,
+                self.out_dim,
+                kernel_size=(1, 3, 3),
+                padding=(0, 1, 1),
+                bias=False,
+            ),
+        )
+
+        # Small residual contribution initially.
+        # 0.1 is preferable to 0 here because it still allows
+        # gradients to flow into all fusion branches immediately.
+        self.gamma = nn.Parameter(
+            torch.tensor(0.1, dtype=torch.float32)
+        )
+
+    def forward(
+        self,
+        feat_s1,
+        feat_s2,
+        feat_final,
+    ):
+        # Full /8 feature is preserved.
+        base = self.base_proj(feat_final)
+
+        # /2 -> /8
+        f1 = self.proj_s1(feat_s1)
+        f1 = self.down_s1(f1)
+
+        # /4 -> /8
+        f2 = self.proj_s2(feat_s2)
+        f2 = self.down_s2(f2)
+
+        target_shape = base.shape[-3:]
+
+        if f1.shape[-3:] != target_shape:
+            raise RuntimeError(
+                "FeatureFusion3D /2 branch spatial mismatch: "
+                f"f1={tuple(f1.shape)}, "
+                f"base={tuple(base.shape)}"
+            )
+
+        if f2.shape[-3:] != target_shape:
+            raise RuntimeError(
+                "FeatureFusion3D /4 branch spatial mismatch: "
+                f"f2={tuple(f2.shape)}, "
+                f"base={tuple(base.shape)}"
+            )
+
+        fused = torch.cat(
+            [f1, f2, base],
+            dim=1,
+        )
+
+        delta = self.mix(fused)
+
+        return base + self.gamma * delta
 
 
 # ============================================================
